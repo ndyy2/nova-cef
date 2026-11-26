@@ -41,6 +41,8 @@ void NetworkSession::Reset()
 	address = asio::ip::udp::endpoint{};
 	handshake_status = HandshakeStatus::NONE;
 	handshake_complete.store(false);
+	client_kcp_confirmed.store(false);
+	client_version.store(0);
 	cef_init_timer_started.store(false);
 	epoch.fetch_add(1);
 	cef_init_state.store(CefInitState::Pending);

@@ -25,7 +25,4 @@ public:
 
 private:
     HookManager& hooks_;
-
-    static void SampInitializationHook() noexcept;
-    static void SampDeinitializationHook() noexcept;
 };

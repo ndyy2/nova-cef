@@ -105,25 +105,24 @@ namespace logging
             _lg->Logf(CefLogLevel::Error, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__);                              \
         }                                                                                                              \
     } while (0)
-#ifndef NDEBUG
 #define LOG_DEBUG(fmt, ...)                                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (auto* _lg = ::logging::GetLogger())                                                                        \
+        if (auto* _lg = ::logging::GetLogger(); _lg && _lg->GetLevel() <= CefLogLevel::Debug)                          \
         {                                                                                                              \
-            _lg->Logf(CefLogLevel::Debug, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__);                              \
+            _lg->Logf(CefLogLevel::Debug, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__);                           \
         }                                                                                                              \
     } while (0)
-#else
-#define LOG_DEBUG(fmt, ...) ((void)0)
-#endif
 
 
 #define LOGX_INFO(lg, fmt, ...) (lg).Logf(CefLogLevel::Info, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
 #define LOGX_WARN(lg, fmt, ...) (lg).Logf(CefLogLevel::Warn, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
 #define LOGX_ERROR(lg, fmt, ...) (lg).Logf(CefLogLevel::Error, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
-#ifndef NDEBUG
-#define LOGX_DEBUG(lg, fmt, ...) (lg).Logf(CefLogLevel::Debug, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
-#else
-#define LOGX_DEBUG(lg, fmt, ...) ((void)0)
-#endif
+#define LOGX_DEBUG(lg, fmt, ...)                                                                                       \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if ((lg).GetLevel() <= CefLogLevel::Debug)                                                                     \
+        {                                                                                                              \
+            (lg).Logf(CefLogLevel::Debug, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__);                           \
+        }                                                                                                              \
+    } while (0)

@@ -13,10 +13,10 @@ option(BUILD_SERVER_SAMP "Build the SA-MP plugin" OFF)
 
 if (WIN32)
 	add_compile_definitions(_WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-	add_compile_options(/MP)
 endif()
 
 if (MSVC)
+	add_compile_options(/MP)
 	# /MT (Release) and /MTd (Debug) - consistent with x86-windows-static triplet.
 	set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 

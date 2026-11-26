@@ -106,8 +106,12 @@
   "use_dyn_ticks": true,
   "website": "https://github.com/aurora-mp/omp-cef",
   "cef": {
+    "bind": "",
     "debug": true,
     "master_resource_key": "OmpCefByNeekoGta",
-    "resources_loader_mode": "samp_dialog"
+    "min_client_version": "1.3.0",
+    "port": 0,
+    "resources_loader_mode": "samp_dialog",
+    "strict_ip_check": true
   }
 }

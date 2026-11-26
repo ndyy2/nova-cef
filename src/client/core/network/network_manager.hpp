@@ -18,6 +18,7 @@ class ResourceManager;
 enum class ConnectionState
 {
 	DISCONNECTED,
+	DISCOVERING_PORT,
 	SENDING_JOIN,
 	AWAITING_CHALLENGE,
 	AWAITING_ACCEPTANCE,
@@ -36,6 +37,7 @@ public:
 	NetworkManager& operator=(const NetworkManager&) = delete;
 
 	bool Initialize(const std::string& ip, unsigned short port);
+	bool Initialize(const std::string& ip, unsigned short game_port, unsigned short fallback_cef_port);
 	void Shutdown();
 
 	void Connect(int playerid);
@@ -54,7 +56,10 @@ public:
 
 private:
 	void DoReceive();
+	void DoSendPortQuery();
+	void BeginJoinWithPort(uint16_t port, const char* source);
 	void DoSendRequestJoin();
+	void DoSendHandshakeFinalize();
 	void DoKcpUpdate();
 
 	void HandleRawMessage(const char* data, size_t len);
@@ -73,8 +78,10 @@ private:
 
 	asio::io_context io_context_;
 	asio::ip::udp::socket socket_{ io_context_ };
+	asio::ip::udp::endpoint game_endpoint_;
 	asio::ip::udp::endpoint server_endpoint_;
 	asio::ip::udp::endpoint remote_endpoint_;
+	uint16_t fallback_cef_port_ = 0;
 	std::thread network_thread_;
 	std::array<char, 65535> recv_buffer_{};
 
@@ -92,8 +99,15 @@ private:
 	PacketHandler packet_handler_;
 	std::mutex handler_mutex_;
 
+	int query_attempts_ = 0;
+	static constexpr int MAX_QUERY_ATTEMPTS = 2;
+
 	int join_attempts_ = 0;
 	static constexpr int MAX_JOIN_ATTEMPTS = 5;
+
+	int finalize_attempts_ = 0;
+	static constexpr int MAX_FINALIZE_ATTEMPTS = 3;
+	HandshakeFinalizePacket pending_finalize_pkt_{};
 
 	std::atomic<bool> non_cef_server_{ false };
 

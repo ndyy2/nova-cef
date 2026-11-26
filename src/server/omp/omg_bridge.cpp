@@ -259,7 +259,7 @@ std::string OmpPlatformBridge::GetPlayerAddressIp(int playerid)
             PeerAddress::AddressString address_str;
             if (PeerAddress::ToString(addr, address_str))
             {
-                return std::string(address_str.data());
+                return std::string(address_str.data(), address_str.length());
             }
         }
     }

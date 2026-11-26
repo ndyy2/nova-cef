@@ -63,6 +63,29 @@ CMakeLists.txt
 CMakePresets.json  # CMake presets (configure/build presets for VS/CMake)
 ```
 
+## Configuration (open.mp)
+
+In `config.json`, the CEF server options can be configured under `cef`:
+
+```json
+"cef": {
+  "bind": "",
+  "debug": false,
+  "master_resource_key": "ThisIsA16ByteKey",
+  "min_client_version": "1.3.0",
+  "port": 0,
+  "resources_loader_mode": "cef",
+  "resources_loader_dialog_id": 32700,
+  "strict_ip_check": true
+}
+```
+
+- `cef.port: 0` (default): automatically uses `network.port + 2` (upstream behavior).
+- `cef.port: 1..65535`: binds the CEF UDP server to the specified port and publishes the open.mp query rule `cef_port=<port>` (`enable_query: true`). Clients built from this repo automatically detect `cef_port` on join (with fallback to `gamePort + 2` on servers without the rule). Legacy/upstream clients (`v1.3.0`–`v1.4.2`) still connect to `gamePort + 2` unless forwarded via NAT/proxy.
+- `cef.bind: ""` (default): falls back to `network.bind` (or `0.0.0.0` if unset). Useful on multi-homed hosts so UDP replies use the same IP as the game server.
+- `cef.min_client_version: "1.3.0"` (default): minimum compatible CEF client version (accepts v1.3.0 through v1.4.x; newer features like `CEF_SetBrowserLayer` are gracefully skipped for `< 1.4.0` clients).
+- `cef.strict_ip_check: true` (default): requires CEF UDP packets to originate from the player's game IP. Set to `false` if players connect through a reverse proxy, Docker NAT, or CGNAT where game and CEF UDP traffic exit from different IPs.
+
 ## Building
 
 Build requirements and detailed setup instructions are documented in the wiki:

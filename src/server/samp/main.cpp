@@ -99,6 +99,40 @@ PLUGIN_EXPORT bool PLUGIN_CALL Load(void** ppData)
 
     const int server_port = config.GetPort(7777);
     const int cef_network_port = config.GetCefUdpPort(2);
+    const std::string bind_address = config.Has("cef_bind")
+        ? config.GetString("cef_bind", "")
+        : config.GetString("bind", "");
+
+    const bool strict_ip_check = config.GetInt("cef_strict_ip_check", 1) != 0;
+
+    uint32_t min_client_version = MIN_CLIENT_VERSION_U32;
+    const std::string min_ver_str = config.GetString("cef_min_client_version", "1.3.0");
+    if (!min_ver_str.empty())
+    {
+        uint32_t parsed = 0;
+        if (ParseVersionU32(min_ver_str, parsed) && parsed >= MIN_CLIENT_VERSION_U32)
+        {
+            min_client_version = parsed;
+        }
+        else
+        {
+            sampgdk::logprintf(
+                "[CEF] [WARN] Invalid cef_min_client_version '%s'. Defaulting to %u.%u.%u.",
+                min_ver_str.c_str(),
+                MIN_CLIENT_VERSION_MAJOR,
+                MIN_CLIENT_VERSION_MINOR,
+                MIN_CLIENT_VERSION_PATCH);
+        }
+    }
+
+    const int derived_port = server_port + 2;
+    if (cef_network_port != derived_port)
+    {
+        sampgdk::logprintf(
+            "[CEF] Using configured UDP port %d (cef_port). Note: official CEF clients connect to gamePort + 2 (%d) unless forwarded via NAT/proxy.",
+            cef_network_port,
+            derived_port);
+    }
 
     std::string debug_str = config.GetString("cef_debug", "0");
     bool debug_enabled_ = (std::stoi(debug_str) != 0);
@@ -120,9 +154,16 @@ PLUGIN_EXPORT bool PLUGIN_CALL Load(void** ppData)
     options.master_resource_key = master_key;
     options.resources_loader_mode = resource_loader_mode;
     options.resources_loader_dialog_id = resource_download_dialog_id;
+    options.bind_address = bind_address;
+    options.min_client_version = min_client_version;
+    options.strict_ip_check = strict_ip_check;
 
     auto bridge = CreateSampPlatformBridge();
-    plugin_->Initialize(std::move(bridge), cef_network_port, options);
+    if (!plugin_->Initialize(std::move(bridge), cef_network_port, options))
+    {
+        sampgdk::logprintf("[CEF] [ERROR] Failed to initialize CEF network server on port %d.", cef_network_port);
+        return false;
+    }
 
     LOG_INFO("Plugin loaded (v%d.%d.%d)", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
 

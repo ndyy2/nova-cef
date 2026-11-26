@@ -100,6 +100,18 @@ void CefApi::SetBrowserVisible(int playerid, int browserid, bool visible)
 
 void CefApi::SetBrowserLayer(int playerid, int browserid, int layer)
 {
+    auto session = plugin_.GetNetworkSessionManager().GetSession(playerid);
+    if (session)
+    {
+        const uint32_t clientVersion = session->client_version.load(std::memory_order_acquire);
+        if (clientVersion != 0 && clientVersion < BROWSER_LAYER_MIN_VERSION_U32)
+        {
+            LOG_DEBUG("SetBrowserLayer skipped for pid=%d (client v%s < v1.4.0.0)",
+                playerid, VersionToString(clientVersion).c_str());
+            return;
+        }
+    }
+
     EmitEventPacket event;
     event.name = CefEvent::Server::SetBrowserLayer;
     event.args.emplace_back(browserid);

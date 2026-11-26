@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <shared/packet.hpp>
+#include <shared/version.hpp>
 #include <unordered_map>
 #include <vector>
 
@@ -24,6 +25,9 @@ struct CefPluginOptions
 	std::vector<uint8_t> master_resource_key = {};
 	ResourceLoaderUiMode resources_loader_mode = ResourceLoaderUiMode::Cef;
 	int resources_loader_dialog_id = ResourceDownloadDialogManager::DefaultDialogId;
+	std::string bind_address = {};
+	uint32_t min_client_version = MIN_CLIENT_VERSION_U32;
+	bool strict_ip_check = true;
 };
 
 struct RegisteredEvent
@@ -50,8 +54,9 @@ public:
 	CefPlugin& operator=(const CefPlugin&) = delete;
 	~CefPlugin();
 
-	void Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t listen_port, const CefPluginOptions& options);
+	bool Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t listen_port, const CefPluginOptions& options);
 	void Shutdown();
+	bool IsRunning() const { return running_.load(); }
 
 	void OnPlayerConnect(int playerid);
 	void OnPlayerClientInit(int playerid);
@@ -89,6 +94,7 @@ public:
 private:
 	void HandleRequestJoin(const asio::ip::udp::endpoint& from, const RequestJoinPacket& packet);
 	void HandleHandshakeFinalize(const asio::ip::udp::endpoint& from, const HandshakeFinalizePacket& finalize_packet, std::shared_ptr<NetworkSession> session);
+	void ScheduleJoinResponseRetry(const std::shared_ptr<NetworkSession>& session, uint64_t epoch, const asio::ip::udp::endpoint& endpoint, JoinResponsePacket join_response, int attempt);
 	void HandleKcpInput(std::shared_ptr<NetworkSession> session);
 	void SendPacketToSession(const std::shared_ptr<NetworkSession>& session, PacketType type, const PacketPayload& payload);
 	void EnqueueMainThreadTask(std::function<void()> task);
@@ -108,6 +114,8 @@ private:
 	Logger logger_;
 
 	std::vector<uint8_t> master_resource_key_;
+	uint32_t min_client_version_ = MIN_CLIENT_VERSION_U32;
+	bool strict_ip_check_ = true;
 	struct PlayerUiState
 	{
 		bool spawnScreenVisible = true;

@@ -5,6 +5,7 @@
 #include <functional>
 #include <atomic>
 #include <array>
+#include <string>
 
 using PacketHandler = std::function<void(const asio::ip::udp::endpoint&, const char*, int)>;
 
@@ -16,13 +17,15 @@ public:
     NetworkServer(unsigned short port,
                   asio::io_context& context,
                   PacketHandler handler,
-                  KcpTickHandler kcp_tick_handler);
+                  KcpTickHandler kcp_tick_handler,
+                  const std::string& bind_address = {});
 
     ~NetworkServer();
 
     void Start();
     void Stop();
     void SendTo(const asio::ip::udp::endpoint& addr, const char* data, int length);
+    asio::ip::udp::endpoint LocalEndpoint() const;
 
 private:
     void DoReceive();

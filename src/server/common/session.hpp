@@ -49,6 +49,8 @@ struct NetworkSession
 
 	HandshakeStatus handshake_status{HandshakeStatus::NONE};
 	std::atomic_bool handshake_complete{false};
+	std::atomic_bool client_kcp_confirmed{false};
+	std::atomic<uint32_t> client_version{0};
 	std::atomic_bool cef_init_timer_started{false};
 	std::atomic<CefInitState> cef_init_state{CefInitState::Pending};
 	std::atomic_bool cef_ready_notified{false};

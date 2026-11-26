@@ -31,6 +31,7 @@ public:
     bool ValidateCookie(const asio::ip::udp::endpoint& client_endpoint, const std::vector<uint8_t>& cookie);
 
     std::vector<uint8_t> InitiateKeyExchange(int playerid);
+    std::vector<uint8_t> GetPendingServerPublicKey(int playerid);
     std::unique_ptr<SessionKeys> FinalizeKeyExchange(int playerid, const std::vector<uint8_t>& client_public_key);
 
 private:

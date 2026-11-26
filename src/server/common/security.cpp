@@ -98,6 +98,16 @@ std::vector<uint8_t> SecurityManager::InitiateKeyExchange(int playerid)
     return pending_key_exchanges_[playerid].server_public_key;
 }
 
+std::vector<uint8_t> SecurityManager::GetPendingServerPublicKey(int playerid)
+{
+    std::lock_guard<std::mutex> lock(kx_mutex_);
+    auto it = pending_key_exchanges_.find(playerid);
+    if (it == pending_key_exchanges_.end())
+        return {};
+
+    return it->second.server_public_key;
+}
+
 std::unique_ptr<SessionKeys> SecurityManager::FinalizeKeyExchange(int playerid,
                                                                   const std::vector<uint8_t>& client_public_key)
 {

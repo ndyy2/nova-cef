@@ -240,52 +240,49 @@ void App::Tick()
                 const std::string host = netGame->GetIp();
                 const int gamePort = netGame->GetPort();
 
-                if (!host.empty() && gamePort > 0)
+                if (!host.empty() && gamePort > 0 && gamePort <= 65535)
                 {
-                    const int cefPortInt = gamePort + cef_port_offset_;
+                    const int fallbackPortInt = gamePort + cef_port_offset_;
+                    const unsigned short fallbackCefPort =
+                        (fallbackPortInt >= 1 && fallbackPortInt <= 65535)
+                            ? static_cast<unsigned short>(fallbackPortInt)
+                            : 0;
+                    const unsigned short gamePortU16 = static_cast<unsigned short>(gamePort);
 
-                    if (cefPortInt <= 0 || cefPortInt > 65535)
+                    const bool endpoint_changed =
+                        (!net_endpoint_ready_ || host != net_host_ || gamePortU16 != net_port_);
+
+                    if (endpoint_changed)
                     {
-                        LOG_ERROR("[CEF] Invalid computed CEF port: gamePort={} offset={} => {}", gamePort, cef_port_offset_, cefPortInt);
-                        next_connect_attempt_ms_ = now + 2000ULL;
+                        net_endpoint_ready_ = false;
+
+                        if (!network_.Initialize(host, gamePortU16, fallbackCefPort))
+                        {
+                            LOG_ERROR("[CEF] Failed to init endpoint {}:{} (fallback CEF port {}) - will retry",
+                                host.c_str(), gamePort, static_cast<int>(fallbackCefPort));
+                            next_connect_attempt_ms_ = now + 2000ULL;
+                        }
+                        else
+                        {
+                            net_endpoint_ready_ = true;
+                            net_host_ = host;
+                            net_port_ = gamePortU16;
+
+                            LOG_INFO("[CEF] Game endpoint {}:{} ready (auto-detecting cef_port, fallback {})",
+                                net_host_.c_str(), static_cast<int>(net_port_), static_cast<int>(fallbackCefPort));
+                        }
+
+                        LOG_DEBUG("[CEF] Server endpoint changed -> resetting session state.");
+                        resources_.OnDisconnect();
+                        ResetSession();
                     }
-                    else
+
+                    if (net_endpoint_ready_)
                     {
-                        const unsigned short cefPort = static_cast<unsigned short>(cefPortInt);
-
-                        const bool endpoint_changed =
-                            (!net_endpoint_ready_ || host != net_host_ || cefPort != net_port_);
-
-                        if (endpoint_changed)
-                        {
-                            net_endpoint_ready_ = false;
-
-                            if (!network_.Initialize(host, cefPort))
-                            {
-                                LOG_ERROR("[CEF] Failed to init endpoint {}:{} (game {} + {}) - will retry", host.c_str(), (int)cefPort, gamePort, cef_port_offset_);
-                                next_connect_attempt_ms_ = now + 2000ULL;
-                            }
-                            else
-                            {
-                                net_endpoint_ready_ = true;
-                                net_host_ = host;
-                                net_port_ = cefPort;
-
-                                LOG_INFO("[CEF] Endpoint {}:{} (derived from {}:{})", net_host_.c_str(), (int)net_port_, host.c_str(), gamePort);
-                            }
-
-                            LOG_DEBUG("[CEF] Server endpoint changed -> resetting session state.");
-                            resources_.OnDisconnect();
-                            ResetSession();
-                        }
-
-                        if (net_endpoint_ready_)
-                        {
-                            connected_player_id_ = localPlayerId;
-                            connected_game_host_ = host;
-                            connected_game_port_ = gamePort;
-                            network_.Connect(localPlayerId);
-                        }
+                        connected_player_id_ = localPlayerId;
+                        connected_game_host_ = host;
+                        connected_game_port_ = gamePort;
+                        network_.Connect(localPlayerId);
                     }
                 }
             }

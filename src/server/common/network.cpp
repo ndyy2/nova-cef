@@ -3,16 +3,43 @@
 
 #include <shared/utils.hpp>
 
+namespace
+{
+    asio::ip::udp::endpoint MakeBindEndpoint(const std::string& bind_address, unsigned short port)
+    {
+        if (!bind_address.empty())
+        {
+            std::error_code ec;
+            auto addr = asio::ip::make_address_v4(bind_address, ec);
+            if (!ec)
+            {
+                return asio::ip::udp::endpoint(addr, port);
+            }
+
+            LOG_WARN("[Network] Invalid IPv4 bind address '%s'. Falling back to 0.0.0.0.", bind_address.c_str());
+        }
+
+        return asio::ip::udp::endpoint(asio::ip::udp::v4(), port);
+    }
+}
+
 NetworkServer::NetworkServer(unsigned short port,
                              asio::io_context& context,
                              PacketHandler handler,
-                             KcpTickHandler kcp_tick_handler)
+                             KcpTickHandler kcp_tick_handler,
+                             const std::string& bind_address)
     : handler_(std::move(handler)),
       kcp_tick_handler_(std::move(kcp_tick_handler)),
       io_context_(context),
-      socket_(io_context_, asio::ip::udp::endpoint(asio::ip::udp::v4(), port)),
+      socket_(io_context_, MakeBindEndpoint(bind_address, port)),
       kcp_update_timer_(context)
 {
+}
+
+asio::ip::udp::endpoint NetworkServer::LocalEndpoint() const
+{
+    std::error_code ec;
+    return socket_.local_endpoint(ec);
 }
 
 NetworkServer::~NetworkServer()

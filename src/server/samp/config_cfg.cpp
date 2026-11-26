@@ -131,6 +131,10 @@ int ConfigCfg::GetPort(int defaultPort) const
 
 int ConfigCfg::GetCefUdpPort(int offset, int defaultCefPort) const
 {
+    const int configured = GetInt("cef_port", 0);
+    if (configured >= 1 && configured <= 65535)
+        return configured;
+
     const int serverPort = GetPort(7777);
     const int cefPort = serverPort + offset;
 

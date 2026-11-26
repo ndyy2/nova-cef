@@ -9,8 +9,10 @@
 #include "samp/components/netgame.hpp"
 #include "samp/hooks/netgame.hpp"
 #include "shared/events.hpp"
+#include "shared/query_port.hpp"
 #include "shared/version.hpp"
 
+constexpr int PORT_QUERY_RETRY_INTERVAL_MS = 350;
 constexpr int CONNECT_RETRY_INTERVAL_MS = 2000;
 constexpr int KCP_UPDATE_INTERVAL_MS = 10;
 
@@ -39,10 +41,23 @@ void NetworkManager::SetSessionActiveHandler(SessionActiveHandler handler)
 
 bool NetworkManager::Initialize(const std::string& ip, unsigned short port)
 {
+	return Initialize(ip, 0, port);
+}
+
+bool NetworkManager::Initialize(const std::string& ip, unsigned short game_port, unsigned short fallback_cef_port)
+{
 	try {
 		SecurityManager::Initialize();
 		asio::ip::udp::resolver resolver(io_context_);
-		server_endpoint_ = *resolver.resolve(asio::ip::udp::v4(), ip, std::to_string(port)).begin();
+		const unsigned short resolve_port = game_port != 0 ? game_port : fallback_cef_port;
+		auto resolved = *resolver.resolve(asio::ip::udp::v4(), ip, std::to_string(resolve_port)).begin();
+		const auto addr = resolved.endpoint().address();
+
+		game_endpoint_ = game_port != 0
+			? asio::ip::udp::endpoint(addr, game_port)
+			: asio::ip::udp::endpoint{};
+		fallback_cef_port_ = fallback_cef_port;
+		server_endpoint_ = asio::ip::udp::endpoint(addr, fallback_cef_port);
 	}
 	catch (const std::exception& e) {
 		LOG_ERROR("[NetworkManager] Initialization failed: {}", e.what());
@@ -52,7 +67,16 @@ bool NetworkManager::Initialize(const std::string& ip, unsigned short port)
 	non_cef_server_.store(false);
 	FireSessionActive(false);
 
-	LOG_INFO("[NetworkManager] Initialized for server at {}:{}", server_endpoint_.address().to_string().c_str(), server_endpoint_.port());
+	if (game_endpoint_.port() != 0)
+	{
+		LOG_INFO("[NetworkManager] Initialized for game server {}:{} (auto-detecting cef_port, fallback {}).",
+			game_endpoint_.address().to_string().c_str(), game_endpoint_.port(), fallback_cef_port_);
+	}
+	else
+	{
+		LOG_INFO("[NetworkManager] Initialized for server at {}:{}",
+			server_endpoint_.address().to_string().c_str(), server_endpoint_.port());
+	}
 	return true;
 }
 
@@ -75,8 +99,13 @@ void NetworkManager::Connect(int playerid)
         CleanupTransport();
     }
 
+    const bool should_discover_port = (game_endpoint_.port() != 0);
+    const ConnectionState initial_state = should_discover_port
+        ? ConnectionState::DISCOVERING_PORT
+        : ConnectionState::SENDING_JOIN;
+
     ConnectionState expected = ConnectionState::DISCONNECTED;
-    if (!state_.compare_exchange_strong(expected, ConnectionState::SENDING_JOIN, std::memory_order_acq_rel, std::memory_order_acquire))
+    if (!state_.compare_exchange_strong(expected, initial_state, std::memory_order_acq_rel, std::memory_order_acquire))
     {
         LOG_WARN("[CLIENT] Connect() rejected: already in state {}", (int)state_.load());
         return;
@@ -91,7 +120,9 @@ void NetworkManager::Connect(int playerid)
     }
 
 	playerid_ = playerid;
+	query_attempts_ = 0;
 	join_attempts_ = 0;
+	finalize_attempts_ = 0;
 
 	LOG_INFO("[CLIENT] Connecting to server for playerid {}...", playerid_);
 
@@ -106,6 +137,19 @@ void NetworkManager::Connect(int playerid)
 
 		LOG_INFO("[CLIENT] Socket opened and bound to local port {}.", socket_.local_endpoint().port());
 		DoReceive();
+
+		auto keys = SecurityManager::GenerateKeys();
+		client_public_key_ = std::move(keys.public_key);
+		client_private_key_ = std::move(keys.private_key);
+
+		if (should_discover_port)
+		{
+			asio::post(io_context_, [this]() { DoSendPortQuery(); });
+		}
+		else
+		{
+			asio::post(io_context_, [this]() { DoSendRequestJoin(); });
+		}
 
 		if (!network_thread_.joinable()) {
 			network_thread_ = std::thread([this]() {
@@ -131,12 +175,6 @@ void NetworkManager::Connect(int playerid)
 				LOG_INFO("[CLIENT] Network thread finished.");
 			});
 		}
-
-		auto keys = SecurityManager::GenerateKeys();
-		client_public_key_ = std::move(keys.public_key);
-		client_private_key_ = std::move(keys.private_key);
-
-		DoSendRequestJoin();
 	}
 	catch (const std::exception& e) {
 		LOG_ERROR("[CLIENT] Connection process failed to start: {}", e.what());
@@ -173,6 +211,67 @@ void NetworkManager::Disconnect()
     CleanupTransport();
 }
 
+void NetworkManager::DoSendPortQuery()
+{
+	if (state_ != ConnectionState::DISCOVERING_PORT)
+		return;
+
+	query_attempts_++;
+	if (query_attempts_ > MAX_QUERY_ATTEMPTS)
+	{
+		BeginJoinWithPort(fallback_cef_port_, "query timeout -> default offset");
+		return;
+	}
+
+	const auto ipv4_bytes = game_endpoint_.address().to_v4().to_bytes();
+	const auto query_pkt = cef_query::BuildSampRulesQuery(ipv4_bytes, game_endpoint_.port());
+	auto buffer = std::make_shared<std::vector<char>>(query_pkt.begin(), query_pkt.end());
+
+	LOG_DEBUG("[CLIENT] Querying server {}:{} for cef_port rule (attempt {}/{})...",
+		game_endpoint_.address().to_string().c_str(), game_endpoint_.port(), query_attempts_, MAX_QUERY_ATTEMPTS);
+
+	if (socket_.is_open())
+	{
+		socket_.async_send_to(
+			asio::buffer(*buffer), game_endpoint_,
+			[buffer](std::error_code ec, std::size_t) {
+				if (ec && ec != asio::error::operation_aborted)
+				{
+					LOG_WARN("[CLIENT] Port query UDP send error: {}", ec.message());
+				}
+			});
+	}
+
+	connect_timer_.expires_after(std::chrono::milliseconds(PORT_QUERY_RETRY_INTERVAL_MS));
+	connect_timer_.async_wait([this](const std::error_code& ec) {
+		if (!ec && state_ == ConnectionState::DISCOVERING_PORT)
+		{
+			DoSendPortQuery();
+		}
+	});
+}
+
+void NetworkManager::BeginJoinWithPort(uint16_t port, const char* source)
+{
+	ConnectionState expected = ConnectionState::DISCOVERING_PORT;
+	if (!state_.compare_exchange_strong(expected, ConnectionState::SENDING_JOIN, std::memory_order_acq_rel, std::memory_order_acquire))
+		return;
+
+	if (port == 0)
+	{
+		LOG_ERROR("[CLIENT] No valid CEF port available ({}). Disconnecting.", source);
+		non_cef_server_.store(true);
+		Disconnect();
+		return;
+	}
+
+	server_endpoint_ = asio::ip::udp::endpoint(game_endpoint_.address(), port);
+	LOG_INFO("[CLIENT] Resolved CEF server endpoint {}:{} ({}).",
+		server_endpoint_.address().to_string().c_str(), server_endpoint_.port(), source);
+
+	DoSendRequestJoin();
+}
+
 void NetworkManager::DoSendRequestJoin()
 {
 	if (state_ != ConnectionState::SENDING_JOIN) 
@@ -201,13 +300,54 @@ void NetworkManager::DoSendRequestJoin()
 	});
 }
 
+void NetworkManager::DoSendHandshakeFinalize()
+{
+	if (state_ != ConnectionState::AWAITING_ACCEPTANCE)
+		return;
+
+	finalize_attempts_++;
+	if (finalize_attempts_ > MAX_FINALIZE_ATTEMPTS)
+	{
+		LOG_WARN("[CLIENT] No JoinResponse after {} HandshakeFinalize attempts -> disconnecting to retry.", MAX_FINALIZE_ATTEMPTS);
+		Disconnect();
+		return;
+	}
+
+	LOG_INFO("[CLIENT] Sending HandshakeFinalize (attempt {}/{})...", finalize_attempts_, MAX_FINALIZE_ATTEMPTS);
+	SendPacket(PacketType::HandshakeFinalize, pending_finalize_pkt_);
+
+	connect_timer_.expires_after(std::chrono::milliseconds(CONNECT_RETRY_INTERVAL_MS));
+	connect_timer_.async_wait([this](const std::error_code& ec) {
+		if (!ec && state_ == ConnectionState::AWAITING_ACCEPTANCE) {
+			LOG_WARN("[CLIENT] HandshakeFinalize timer expired, retrying...");
+			DoSendHandshakeFinalize();
+		}
+	});
+}
+
 void NetworkManager::DoReceive()
 {
 	socket_.async_receive_from(
 		asio::buffer(recv_buffer_), remote_endpoint_,
 		[this](std::error_code ec, std::size_t bytes_recvd) {
 			if (!ec && bytes_recvd > 0) {
-				if (remote_endpoint_ == server_endpoint_) {
+				if (state_ == ConnectionState::DISCOVERING_PORT) {
+					if (remote_endpoint_ == game_endpoint_) {
+						uint16_t discovered_port = 0;
+						const auto parse_result = cef_query::ParseSampRulesCefPort(
+							recv_buffer_.data(), bytes_recvd, discovered_port);
+
+						if (parse_result == cef_query::QueryParseResult::Found) {
+							connect_timer_.cancel();
+							BeginJoinWithPort(discovered_port, "server query rule cef_port");
+						}
+						else if (parse_result == cef_query::QueryParseResult::NotFound) {
+							connect_timer_.cancel();
+							BeginJoinWithPort(fallback_cef_port_, "default offset (no cef_port rule)");
+						}
+					}
+				}
+				else if (remote_endpoint_ == server_endpoint_) {
 					HandleRawMessage(recv_buffer_.data(), bytes_recvd);
 				}
 			}
@@ -267,25 +407,29 @@ void NetworkManager::HandleRawMessage(const char* data, size_t len)
 				return;
 			}
 
-			HandshakeFinalizePacket finalize_pkt;
-			finalize_pkt.cookie = challenge.cookie;
-			finalize_pkt.client_public_key = client_public_key_;
-
-			LOG_INFO("[CLIENT] Sending HandshakeFinalize...");
-			SendPacket(PacketType::HandshakeFinalize, finalize_pkt);
-
 			auto session_keys = SecurityManager::GenerateClientSessionKeys(
 				client_public_key_, client_private_key_, challenge.server_public_key);
 			if (session_keys.rx.empty()) { Disconnect(); return; }
 			rx_key_ = std::move(session_keys.rx);
 			tx_key_ = std::move(session_keys.tx);
 			sodium_memzero(client_private_key_.data(), client_private_key_.size());
+
+			pending_finalize_pkt_ = HandshakeFinalizePacket{};
+			pending_finalize_pkt_.cookie = challenge.cookie;
+			pending_finalize_pkt_.client_public_key = client_public_key_;
+			finalize_attempts_ = 0;
+
+			DoSendHandshakeFinalize();
 			break;
 		}
 		case PacketType::JoinResponse:
 		{
 			if (state_ != ConnectionState::AWAITING_ACCEPTANCE && state_ != ConnectionState::SENDING_JOIN)
 				return;
+
+			connect_timer_.cancel();
+			pending_finalize_pkt_ = HandshakeFinalizePacket{};
+			finalize_attempts_ = 0;
 
 			const auto& response = std::get<JoinResponsePacket>(packet.payload);
 			if (!response.accepted) {
@@ -416,7 +560,10 @@ void NetworkManager::CleanupTransport()
     tx_key_.clear();
     client_public_key_.clear();
     client_private_key_.clear();
+    pending_finalize_pkt_ = HandshakeFinalizePacket{};
+    query_attempts_ = 0;
     join_attempts_ = 0;
+    finalize_attempts_ = 0;
     playerid_ = -1;
 }
 

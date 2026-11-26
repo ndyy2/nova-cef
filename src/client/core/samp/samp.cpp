@@ -7,6 +7,58 @@
 #include "system/logger.hpp"
 
 static Samp* g_samp_self = nullptr;
+static void* g_samp_init_return = nullptr;
+static void* g_samp_deinit_return = nullptr;
+
+static void __cdecl HandleSampInitialization() noexcept
+{
+    LOG_INFO("Loading SA-MP ...");
+
+    g_samp_init_return = g_samp_self ? g_samp_self->GetOriginal("SampInitialization") : nullptr;
+    if (g_samp_self)
+        g_samp_self->DisableHook("SampInitialization");
+
+    if (g_samp_self && g_samp_self->OnLoaded)
+        g_samp_self->OnLoaded();
+
+    LOG_INFO("SA-MP loaded.");
+}
+
+static void __cdecl HandleSampDeinitialization() noexcept
+{
+    LOG_INFO("Exit SA-MP ...");
+
+    g_samp_deinit_return = g_samp_self ? g_samp_self->GetOriginal("SampDeinitialization") : nullptr;
+    if (g_samp_self)
+        g_samp_self->DisableHook("SampDeinitialization");
+
+    if (g_samp_self && g_samp_self->OnExit)
+        g_samp_self->OnExit();
+}
+
+static __declspec(naked) void SampInitializationHookThunk() noexcept
+{
+    __asm {
+        pushad
+        pushfd
+        call HandleSampInitialization
+        popfd
+        popad
+        jmp g_samp_init_return
+    }
+}
+
+static __declspec(naked) void SampDeinitializationHookThunk() noexcept
+{
+    __asm {
+        pushad
+        pushfd
+        call HandleSampDeinitialization
+        popfd
+        popad
+        jmp g_samp_deinit_return
+    }
+}
 
 bool Samp::Initialize()
 {
@@ -21,8 +73,8 @@ bool Samp::Initialize()
         return false;
     }
 
-    if (!hooks_.Install("SampInitialization", addrInit, reinterpret_cast<void*>(&SampInitializationHook)) ||
-        !hooks_.Install("SampDeinitialization", addrDeinit, reinterpret_cast<void*>(&SampDeinitializationHook)))
+    if (!hooks_.Install("SampInitialization", addrInit, reinterpret_cast<void*>(&SampInitializationHookThunk)) ||
+        !hooks_.Install("SampDeinitialization", addrDeinit, reinterpret_cast<void*>(&SampDeinitializationHookThunk)))
     {
         LOG_FATAL("Failed to hook Samp.");
         return false;
@@ -41,77 +93,4 @@ void* Samp::GetOriginal(const char* name) const
 void Samp::DisableHook(const char* name)
 {
     hooks_.Disable(name);
-}
-
-/*void Samp::SetControlsLocked(bool locked)
-{
-    if (auto* game = GetComponent<GameComponent>())
-    {
-        if (locked)
-        {
-            if (g_pD3DDeviceHook)
-                g_pD3DDeviceHook->SetForceHideCursor(TRUE);
-            game->SetCursorMode(CMODE_LOCKCAMANDCONTROL, TRUE);
-        }
-        else
-        {
-            if (g_pD3DDeviceHook)
-                g_pD3DDeviceHook->SetForceHideCursor(FALSE);
-            game->SetCursorMode(CMODE_NONE, TRUE);
-        }
-    }
-}*/
-
-void __declspec(naked) Samp::SampInitializationHook() noexcept
-{
-    static void* return_address = nullptr;
-
-    __asm {
-        pushad
-        mov  ebp, esp
-        sub  esp, __LOCAL_SIZE
-    }
-
-    LOG_INFO("Loading SA-MP ...");
-
-    return_address = g_samp_self ? g_samp_self->GetOriginal("SampInitialization") : nullptr;
-    if (g_samp_self)
-        g_samp_self->DisableHook("SampInitialization");
-
-    if (g_samp_self && g_samp_self->OnLoaded)
-        g_samp_self->OnLoaded();
-
-    LOG_INFO("SA-MP loaded.");
-
-    __asm {
-        mov esp, ebp
-        popad
-        jmp return_address
-    }
-}
-
-void __declspec(naked) Samp::SampDeinitializationHook() noexcept
-{
-    static void* return_address = nullptr;
-
-    __asm {
-        pushad
-        mov  ebp, esp
-        sub  esp, __LOCAL_SIZE
-    }
-
-    LOG_INFO("Exit SA-MP ...");
-
-    return_address = g_samp_self ? g_samp_self->GetOriginal("SampDeinitialization") : nullptr;
-    if (g_samp_self)
-        g_samp_self->DisableHook("SampDeinitialization");
-
-    if (g_samp_self && g_samp_self->OnExit)
-        g_samp_self->OnExit();
-
-    __asm {
-        mov esp, ebp
-        popad
-        jmp return_address
-    }
 }

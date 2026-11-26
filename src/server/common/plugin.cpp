@@ -13,6 +13,40 @@
 namespace
 {
     constexpr uint16_t DefaultListenPort = 7779;
+    constexpr int MaxJoinResponseRetries = 3;
+    constexpr int JoinResponseRetryDelaysMs[MaxJoinResponseRetries] = { 500, 1000, 1500 };
+
+    std::string NormalizeIpAddress(std::string ip)
+    {
+        static constexpr const char* kIpv4MappedPrefix = "::ffff:";
+        static constexpr size_t kIpv4MappedPrefixLen = 7;
+
+        if (ip.size() > kIpv4MappedPrefixLen)
+        {
+            bool match = true;
+            for (size_t i = 0; i < kIpv4MappedPrefixLen; ++i)
+            {
+                const char c = ip[i];
+                const char lower = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+                if (lower != kIpv4MappedPrefix[i])
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match)
+                ip.erase(0, kIpv4MappedPrefixLen);
+        }
+
+        return ip;
+    }
+
+    bool IsRequestJoinLengthValid(int len)
+    {
+        const auto legacy_request_join_size = static_cast<int>(1 + sizeof(int));
+        const auto request_join_size = static_cast<int>(legacy_request_join_size + sizeof(uint32_t));
+        return len == legacy_request_join_size || len == request_join_size;
+    }
 }
 
 CefPlugin::CefPlugin()
@@ -23,13 +57,15 @@ CefPlugin::CefPlugin()
 	resource_ = std::make_unique<ResourceManager>();
 }
 
-void CefPlugin::Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t listen_port, const CefPluginOptions& options)
+bool CefPlugin::Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t listen_port, const CefPluginOptions& options)
 {
 	if (running_)
-		return;
+		return true;
 
 	bridge_ = std::move(bridge);
 	master_resource_key_ = options.master_resource_key;
+	min_client_version_ = options.min_client_version != 0 ? options.min_client_version : MIN_CLIENT_VERSION_U32;
+	strict_ip_check_ = options.strict_ip_check;
 	resource_download_dialogs_.SetMode(options.resources_loader_mode);
 	resource_download_dialogs_.SetDialogId(options.resources_loader_dialog_id);
 
@@ -37,12 +73,12 @@ void CefPlugin::Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t lis
 	logger_.SetLevel(options.log_level);
 	logging::SetLogger(&logger_);
 
-	security_->Initialize(io_context_);
-
     const uint16_t port = (listen_port != 0 ? listen_port : DefaultListenPort);
 
 	try
 	{
+		security_->Initialize(io_context_);
+
 		network_server_ = std::make_unique<NetworkServer>(
 			port,
 			io_context_,
@@ -54,7 +90,8 @@ void CefPlugin::Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t lis
 			{
 				sessions_->UpdateAllKcpInstances(now_ms);
 				this->ProcessFileTransfers();
-			});
+			},
+			options.bind_address);
 
 		sessions_->SetSender(
 			[this](const asio::ip::udp::endpoint& addr, const char* data, int len)
@@ -68,22 +105,58 @@ void CefPlugin::Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t lis
 		network_server_->Start();
 
 		io_context_.restart();
-
-		network_thread_ = std::thread([this]() {
-			io_context_.run();
-		});
-
 		running_ = true;
 
-		LOG_INFO("Network Server started successfully on port %d.", (int)port);
+		network_thread_ = std::thread([this]() {
+			while (running_)
+			{
+				try
+				{
+					io_context_.run();
+					break;
+				}
+				catch (const std::exception& e)
+				{
+					LOG_ERROR("[Network] Exception on network thread: %s", e.what());
+				}
+				catch (...)
+				{
+					LOG_ERROR("[Network] Unknown exception on network thread.");
+				}
+
+				if (running_)
+				{
+					io_context_.restart();
+				}
+			}
+		});
+
+		const auto bound = network_server_->LocalEndpoint();
+		LOG_INFO("Network Server started successfully on %s:%u (min client v%s, strict_ip_check=%s).",
+			bound.address().to_string().c_str(),
+			static_cast<unsigned int>(bound.port()),
+			VersionToString(min_client_version_).c_str(),
+			strict_ip_check_ ? "true" : "false");
+		return true;
 	}
 	catch (const std::exception& e)
 	{
+		running_ = false;
+		LOG_ERROR("Failed to start Network Server on %s:%u: %s",
+			options.bind_address.empty() ? "0.0.0.0" : options.bind_address.c_str(),
+			static_cast<unsigned int>(port),
+			e.what());
+
+		if (network_server_)
+			network_server_->Stop();
 		network_server_.reset();
+
+		if (security_)
+			security_->Shutdown();
+
 		logging::SetLogger(nullptr);
 		bridge_.reset();
-
-		LOG_ERROR("Failed to start Network Server: %s", e.what());
+		return false;
 	}
 }
 
@@ -137,11 +210,11 @@ void CefPlugin::OnPlayerConnect(int playerid)
     }
 
 	// Read open.mp player data only from this server-thread callback. The ASIO
-	// handshake uses the immutable snapshot stored in NetworkSession.
-	const std::string officialIp = bridge_->GetPlayerAddressIp(playerid);
+	// handshake uses the snapshot stored in NetworkSession.
+	const std::string officialIp = NormalizeIpAddress(bridge_->GetPlayerAddressIp(playerid));
 	sessions_->RegisterPlayer(playerid, officialIp);
     player_ui_states_[playerid] = PlayerUiState{};
-    LOG_DEBUG("OnPlayerConnect: player %d registered", playerid);
+    LOG_DEBUG("OnPlayerConnect: player %d registered (ip=%s)", playerid, officialIp.c_str());
 }
 
 void CefPlugin::OnPlayerClientInit(int playerid)
@@ -154,6 +227,19 @@ void CefPlugin::OnPlayerClientInit(int playerid)
     {
         LOG_WARN("OnPlayerClientInit: no session for player %d (not registered?)", playerid);
         return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(session->kcp_mutex);
+        if (session->official_ip.empty())
+        {
+            const std::string refreshedIp = NormalizeIpAddress(bridge_->GetPlayerAddressIp(playerid));
+            if (!refreshedIp.empty())
+            {
+                session->official_ip = refreshedIp;
+                LOG_DEBUG("OnPlayerClientInit: refreshed game IP for player %d (%s)", playerid, refreshedIp.c_str());
+            }
+        }
     }
 
     if (session->handshake_complete && session->cef_init_state.load() == CefInitState::Pending)
@@ -169,18 +255,17 @@ void CefPlugin::OnPlayerClientInit(int playerid)
 	{
 	    return;
 	}
-	const uint64_t epoch = session->epoch.load();
 	const std::weak_ptr<NetworkSession> weakSession = session;
 
     auto timer = std::make_shared<asio::steady_timer>(io_context_);
     timer->expires_after(std::chrono::seconds(10));
-	timer->async_wait([this, playerid, weakSession, epoch, timer](const std::error_code& error_code)
+	timer->async_wait([this, playerid, weakSession, timer](const std::error_code& error_code)
     {
         if (error_code || !running_ || !bridge_)
             return;
 
 		auto session = weakSession.lock();
-		if (!IsSessionCurrent(session, epoch))
+		if (!session || !sessions_ || sessions_->GetSession(playerid) != session)
             return;
 
 		if (!session->handshake_complete && session->cef_init_state.load() == CefInitState::Pending)
@@ -234,14 +319,29 @@ void CefPlugin::OnPacketReceived(const asio::ip::udp::endpoint& from, const char
 	auto network_session = sessions_->GetSessionFromAddress(from);
 	bool receivedKcpPacket = false;
 	bool awaitingHandshakeFinalize = false;
+	bool allowUnconfirmedRejoin = false;
 	if (network_session)
 	{
 		{
 			std::lock_guard<std::mutex> lock(network_session->kcp_mutex);
 			if (network_session->handshake_status == HandshakeStatus::CONNECTED && network_session->kcp_instance)
 			{
-				ikcp_input(network_session->kcp_instance, data, len);
-				receivedKcpPacket = true;
+				const int kcp_res = ikcp_input(network_session->kcp_instance, data, len);
+				if (kcp_res == 0)
+				{
+					network_session->client_kcp_confirmed.store(true, std::memory_order_release);
+					receivedKcpPacket = true;
+				}
+				else if (!network_session->client_kcp_confirmed.load(std::memory_order_acquire))
+				{
+					// Client never sent a valid KCP frame yet (e.g. JoinResponse was lost
+					// on UDP and client retried/restarted). Allow raw RequestJoin recovery.
+					allowUnconfirmedRejoin = true;
+				}
+				else
+				{
+					receivedKcpPacket = true;
+				}
 			}
 			else
 			{
@@ -251,8 +351,8 @@ void CefPlugin::OnPacketReceived(const asio::ip::udp::endpoint& from, const char
 
 		if (receivedKcpPacket)
 		{
-		HandleKcpInput(network_session);
-		return;
+			HandleKcpInput(network_session);
+			return;
 		}
 	}
 
@@ -260,20 +360,19 @@ void CefPlugin::OnPacketReceived(const asio::ip::udp::endpoint& from, const char
 
     // Before a transport is attached to an endpoint, the server must only accept
     // the raw packets that are correct for the current handshake state.
-    if (!network_session)
+    if (!network_session || allowUnconfirmedRejoin)
     {
-        const auto legacy_request_join_size = static_cast<int>(1 + sizeof(int));
-        const auto request_join_size = static_cast<int>(legacy_request_join_size + sizeof(uint32_t));
-
-        if (packet_type != PacketType::RequestJoin ||
-            (len != legacy_request_join_size && len != request_join_size))
+        if (packet_type != PacketType::RequestJoin || !IsRequestJoinLengthValid(len))
         {
             return;
         }
     }
 	else if (awaitingHandshakeFinalize)
     {
-        if (packet_type != PacketType::HandshakeFinalize)
+        // Allow both HandshakeFinalize and retried RequestJoin from the same
+        // endpoint in case the initial HandshakeChallenge UDP datagram was lost.
+        const bool is_valid_retry = (packet_type == PacketType::RequestJoin && IsRequestJoinLengthValid(len));
+        if (packet_type != PacketType::HandshakeFinalize && !is_valid_retry)
             return;
     }
     else
@@ -294,7 +393,7 @@ void CefPlugin::OnPacketReceived(const asio::ip::udp::endpoint& from, const char
             const auto& join_packet = std::get<RequestJoinPacket>(packet.payload);
             allow_fresh_join_from_reused_endpoint =
                 join_packet.playerid >= 0 &&
-                join_packet.client_version == PLUGIN_VERSION_U32 &&
+                IsClientVersionSupported(join_packet.client_version, min_client_version_) &&
                 sessions_->GetSession(join_packet.playerid) != nullptr;
         }
 
@@ -329,7 +428,7 @@ void CefPlugin::HandleRequestJoin(const asio::ip::udp::endpoint& from, const Req
 		return;
 
     const int playerid = join_packet.playerid;
-    const std::string from_ip = from.address().to_string();
+    const std::string from_ip = NormalizeIpAddress(from.address().to_string());
     const int from_port = static_cast<int>(from.port());
 
     if (playerid < 0)
@@ -345,25 +444,40 @@ void CefPlugin::HandleRequestJoin(const asio::ip::udp::endpoint& from, const Req
         return;
     }
 
-	const std::string official_ip = session->official_ip;
+	std::string official_ip;
+	{
+		std::lock_guard<std::mutex> lock(session->kcp_mutex);
+		official_ip = session->official_ip;
+	}
 
-    if (official_ip.empty())
+    if (strict_ip_check_)
     {
-        LOG_WARN("RequestJoin dropped: unknown game IP for pid=%d (from %s:%d)", playerid, from_ip.c_str(), from_port);
-        return;
-    }
+        if (official_ip.empty())
+        {
+            LOG_WARN("RequestJoin dropped: unknown game IP for pid=%d (from %s:%d). Set cef.strict_ip_check=false if running behind a proxy/NAT.",
+                playerid, from_ip.c_str(), from_port);
+            return;
+        }
 
-    if (official_ip != from_ip)
+        if (official_ip != from_ip)
+        {
+            LOG_WARN("RequestJoin dropped: IP mismatch (pid=%d, official=%s, from=%s). Set cef.strict_ip_check=false if players connect through NAT/proxy/CGNAT.",
+                playerid, official_ip.c_str(), from_ip.c_str());
+            return;
+        }
+    }
+    else if (!official_ip.empty() && official_ip != from_ip)
     {
-        LOG_WARN("RequestJoin dropped: IP mismatch (pid=%d, official=%s, from=%s)", playerid, official_ip.c_str(), from_ip.c_str());
-        return;
+        LOG_DEBUG("RequestJoin IP differs (pid=%d, official=%s, from=%s) -> allowed (strict_ip_check=false)",
+            playerid, official_ip.c_str(), from_ip.c_str());
     }
-
-    LOG_INFO("RequestJoin pid=%d from=%s:%d", playerid, from_ip.c_str(), from_port);
 
     const uint32_t clientVersion = join_packet.client_version;
     const uint32_t serverVersion = PLUGIN_VERSION_U32;
-	if (clientVersion != serverVersion)
+    LOG_INFO("RequestJoin pid=%d from=%s:%d client=v%s",
+        playerid, from_ip.c_str(), from_port, VersionToString(clientVersion).c_str());
+
+	if (!IsClientVersionSupported(clientVersion, min_client_version_))
 	{
         JoinResponsePacket reject;
         reject.accepted = false;
@@ -372,11 +486,12 @@ void CefPlugin::HandleRequestJoin(const asio::ip::udp::endpoint& from, const Req
         reject.reject_reason = static_cast<uint8_t>(JoinRejectReason::VersionMismatch);
         reject.server_version = serverVersion;
         reject.client_version = clientVersion;
-        reject.message = "CEF version mismatch";
+        reject.message = "CEF version unsupported (min v" + VersionToString(min_client_version_) + ")";
 
-        LOG_WARN("RequestJoin refused: version mismatch (pid=%d client=%s server=%s)",
+        LOG_WARN("RequestJoin refused: unsupported client version (pid=%d client=%s min=%s server=%s)",
             playerid,
             VersionToString(clientVersion).c_str(),
+            VersionToString(min_client_version_).c_str(),
             VersionToString(serverVersion).c_str());
 
         SendRawPacketToEndpoint(from, PacketType::JoinResponse, reject);
@@ -397,26 +512,49 @@ void CefPlugin::HandleRequestJoin(const asio::ip::udp::endpoint& from, const Req
 
 	HandshakeStatus previousStatus;
 	asio::ip::udp::endpoint previousAddress;
+	bool kcpConfirmed = false;
 	{
 		std::lock_guard<std::mutex> lock(session->kcp_mutex);
 		previousStatus = session->handshake_status;
 		previousAddress = session->address;
+		kcpConfirmed = session->client_kcp_confirmed.load(std::memory_order_acquire);
 	}
 
 	if (previousStatus == HandshakeStatus::CONNECTED)
 	{
-		if (previousAddress == from)
+		if (previousAddress == from && kcpConfirmed)
 		{
 			LOG_DEBUG("RequestJoin ignored: pid=%d already CONNECTED on the same endpoint", playerid);
 			return;
         }
 
-		LOG_INFO("RequestJoin rejoin: pid=%d endpoint changed from %s:%d to %s:%d -> resetting CEF transport",
+		LOG_INFO("RequestJoin rejoin: pid=%d endpoint %s:%d -> %s:%d (kcp_confirmed=%d) -> resetting CEF transport",
 			playerid,
 			previousAddress.address().to_string().c_str(),
 			static_cast<int>(previousAddress.port()),
 			from_ip.c_str(),
-			from_port);
+			from_port,
+			kcpConfirmed ? 1 : 0);
+	}
+	else if (previousStatus == HandshakeStatus::CHALLENGED && previousAddress == from)
+	{
+		// Same endpoint retried RequestJoin (e.g. HandshakeChallenge was lost or delayed).
+		// Reuse the pending server keypair so an in-flight delayed challenge still derives
+		// the exact same X25519 session keys as this resent challenge.
+		std::vector<uint8_t> existing_pub = security_->GetPendingServerPublicKey(playerid);
+		if (existing_pub.size() == crypto_kx_PUBLICKEYBYTES)
+		{
+			session->client_version.store(clientVersion, std::memory_order_release);
+
+			HandshakeChallengePacket response;
+			response.cookie = security_->GenerateCookie(from);
+			response.server_public_key = std::move(existing_pub);
+
+			LOG_DEBUG("RequestJoin retry: pid=%d resending HandshakeChallenge to %s:%d",
+				playerid, from_ip.c_str(), from_port);
+			SendRawPacketToEndpoint(from, PacketType::HandshakeChallenge, response);
+			return;
+		}
 	}
 	else if (previousStatus == HandshakeStatus::CHALLENGED && previousAddress != from)
 	{
@@ -437,6 +575,7 @@ void CefPlugin::HandleRequestJoin(const asio::ip::udp::endpoint& from, const Req
 		std::lock_guard<std::mutex> lock(session->kcp_mutex);
 		session->address = from;
 		session->handshake_status = HandshakeStatus::CHALLENGED;
+		session->client_version.store(clientVersion, std::memory_order_release);
 	}
 
 	if (!sessions_->MapAddressToPlayer(playerid, session, from))
@@ -493,12 +632,14 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
         return;
     }
 
+	const uint32_t negotiated_client_version = session->client_version.load(std::memory_order_acquire);
+
 	JoinResponsePacket join_response;
 	join_response.accepted = true;
 	join_response.kcp_conv_id = session->playerid;
     join_response.reject_reason = static_cast<uint8_t>(JoinRejectReason::None);
     join_response.server_version = PLUGIN_VERSION_U32;
-    join_response.client_version = PLUGIN_VERSION_U32;
+    join_response.client_version = negotiated_client_version != 0 ? negotiated_client_version : PLUGIN_VERSION_U32;
     join_response.message.clear();
 
 	nlohmann::json manifest = resource_->GetManifestAsJson();
@@ -525,6 +666,7 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
 				ikcp_nodelay(session->kcp_instance, 1, 10, 2, 1);
 				ikcp_wndsize(session->kcp_instance, 256, 256);
 				session->handshake_status = HandshakeStatus::CONNECTED;
+				session->client_kcp_confirmed.store(false, std::memory_order_release);
 				transportCreated = true;
 			}
 		}
@@ -557,9 +699,54 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
 	}
 	session->handshake_complete = true;
 
+	ScheduleJoinResponseRetry(session, epoch, from, std::move(join_response), 0);
+
     NotifyCefInitialize(session, true, CEF_INIT_OK, "");
 
-    LOG_DEBUG("Network handshake for player %d is complete.", session->playerid);
+    LOG_INFO("Network handshake for player %d is complete (client=v%s).",
+        session->playerid, VersionToString(negotiated_client_version).c_str());
+}
+
+void CefPlugin::ScheduleJoinResponseRetry(
+	const std::shared_ptr<NetworkSession>& session,
+	uint64_t epoch,
+	const asio::ip::udp::endpoint& endpoint,
+	JoinResponsePacket join_response,
+	int attempt)
+{
+	if (!running_ || !session || attempt >= MaxJoinResponseRetries)
+		return;
+
+	const std::weak_ptr<NetworkSession> weakSession = session;
+	auto timer = std::make_shared<asio::steady_timer>(io_context_);
+	timer->expires_after(std::chrono::milliseconds(JoinResponseRetryDelaysMs[attempt]));
+	timer->async_wait([this, weakSession, epoch, endpoint, join_response = std::move(join_response), attempt, timer](const std::error_code& ec) mutable
+	{
+		if (ec || !running_)
+			return;
+
+		auto current = weakSession.lock();
+		if (!IsSessionCurrent(current, epoch))
+			return;
+
+		if (current->client_kcp_confirmed.load(std::memory_order_acquire))
+			return;
+
+		LOG_DEBUG("Retransmitting JoinResponse for pid=%d (attempt %d/%d, client KCP not yet confirmed)",
+			current->playerid, attempt + 1, MaxJoinResponseRetries);
+
+		SendRawPacketToEndpoint(endpoint, PacketType::JoinResponse, join_response);
+
+		{
+			std::lock_guard<std::mutex> lock(current->kcp_mutex);
+			if (current->kcp_instance && current->handshake_status == HandshakeStatus::CONNECTED)
+			{
+				ikcp_flush(current->kcp_instance);
+			}
+		}
+
+		ScheduleJoinResponseRetry(current, epoch, endpoint, std::move(join_response), attempt + 1);
+	});
 }
 
 void CefPlugin::HandleKcpInput(std::shared_ptr<NetworkSession> session)

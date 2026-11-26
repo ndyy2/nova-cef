@@ -38,7 +38,10 @@ public:
     void onPlayerDisconnect(IPlayer& player, PeerDisconnectReason reason) override;
 
 private:
+    void PublishQueryRules();
+
     static constexpr uint16_t cef_network_port_offset = 2;
+    static constexpr uint16_t default_cef_network_port = 7779;
 
 private:
 	ICore* core_ = nullptr;
@@ -50,6 +53,9 @@ private:
     std::vector<uint8_t> master_resource_key_;
     ResourceLoaderUiMode resource_loader_ui_mode_ = ResourceLoaderUiMode::Cef;
     int resource_download_dialog_id_ = ResourceDownloadDialogManager::DefaultDialogId;
+    std::string bind_address_;
+    uint32_t min_client_version_ = MIN_CLIENT_VERSION_U32;
+    bool strict_ip_check_ = true;
 
     uint16_t server_port_ = 7777;
     uint16_t cef_network_port_ = 7779;
