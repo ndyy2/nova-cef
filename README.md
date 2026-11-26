@@ -1,16 +1,15 @@
-# omp-cef
+# nova-cef (`omp-cef`)
 
-![Version](https://img.shields.io/github/v/release/aurora-mp/omp-cef?include_prereleases&label=version)
-![License](https://img.shields.io/github/license/aurora-mp/omp-cef)
+![Version](https://img.shields.io/github/v/release/ndyy2/nova-cef?include_prereleases&label=version)
+![License](https://img.shields.io/github/license/ndyy2/nova-cef)
 [![Wiki](https://img.shields.io/badge/docs-wiki-blue)](https://github.com/aurora-mp/omp-cef/wiki)
 ![CEF](https://img.shields.io/badge/CEF-158.0.3-blue)
 ![SA--MP](https://img.shields.io/badge/SA--MP-0.3.7%20%7C%200.3.DL-orange)
 ![open.mp](https://img.shields.io/badge/open.mp-supported-brightgreen)
-[![Discord](https://img.shields.io/discord/1384880714377465876?label=Discord&logo=discord&logoColor=white&color=5865F2)](https://discord.gg/Jv95ygPSNY)
 
-Client/server CEF plugin for **open.mp** and **SA-MP**.
+Client/server CEF plugin for **open.mp** and **SA-MP**, maintained by **[@ndyy2](https://github.com/ndyy2)** (forked from [aurora-mp/omp-cef](https://github.com/aurora-mp/omp-cef)).
 
-`omp-cef` embeds Chromium Embedded Framework into GTA San Andreas Multiplayer clients and allows servers to create browser-based UI in several rendering modes: Overlay2D, World2D and WorldObject3D.
+`nova-cef` embeds Chromium Embedded Framework into GTA San Andreas Multiplayer clients and allows servers to create browser-based UI in several rendering modes: Overlay2D, World2D and WorldObject3D.
 
 ## Features
 
@@ -26,7 +25,8 @@ Client/server CEF plugin for **open.mp** and **SA-MP**.
 - Game screen capture exposed to CEF interfaces as RGBA frames
 - Custom ESC menu support
 - Custom TAB menu (scoreboard) support
-- Secure client/server handshake and UDP transport
+- Secure client/server handshake and MTU-safe KCP/UDP transport
+- Automatic `cef_port` discovery via server query rules with backward compatibility for v1.3.0+ clients
 
 ## Documentation
 
@@ -71,6 +71,7 @@ In `config.json`, the CEF server options can be configured under `cef`:
 "cef": {
   "bind": "",
   "debug": false,
+  "init_timeout": 15,
   "master_resource_key": "ThisIsA16ByteKey",
   "min_client_version": "1.3.0",
   "port": 0,
@@ -85,6 +86,8 @@ In `config.json`, the CEF server options can be configured under `cef`:
 - `cef.bind: ""` (default): falls back to `network.bind` (or `0.0.0.0` if unset). Useful on multi-homed hosts so UDP replies use the same IP as the game server.
 - `cef.min_client_version: "1.3.0"` (default): minimum compatible CEF client version (accepts v1.3.0 through v1.4.x; newer features like `CEF_SetBrowserLayer` are gracefully skipped for `< 1.4.0` clients).
 - `cef.strict_ip_check: true` (default): requires CEF UDP packets to originate from the player's game IP. Set to `false` if players connect through a reverse proxy, Docker NAT, or CGNAT where game and CEF UDP traffic exit from different IPs.
+- `cef.init_timeout: 15` (default, clamped to `5..60` seconds; `cef_init_timeout` in SA-MP `server.cfg`): maximum time the server waits for the CEF handshake after `OnPlayerClientInit` before firing `CEF_INIT_TIMEOUT`.
+- **Reliable KCP manifest delivery (`v1.4.3+`)**: clients `v1.4.3+` receive the resource manifest reliably over KCP (`MTU = 1200`) inside `ServerConfig`, keeping raw UDP `JoinResponse` packets small to prevent IP fragmentation drops on mobile/PPPoE/VPN/CGNAT connections. Legacy clients (`v1.3.0`–`v1.4.2`) remain fully supported.
 
 ## Building
 
@@ -109,6 +112,11 @@ Short version:
 - Browser lifecycle
 - Hidden browser navigation
 - Stress testing
+
+## Credits
+
+- **[@ndyy2](https://github.com/ndyy2)** — `nova-cef` fork maintainer (custom `cef_port` auto-detection, KCP manifest delivery & MTU-safe transport, handshake retry & timeout reliability fixes, v1.3.0+ compatibility)
+- **[aurora-mp/omp-cef](https://github.com/aurora-mp/omp-cef)** — Original `omp-cef` project and upstream contributors
 
 ## Contributing
 
