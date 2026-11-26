@@ -228,7 +228,7 @@ void App::Tick()
         }
     }
 
-    if (network_.GetState() == ConnectionState::DISCONNECTED && !network_.IsNonCefServer())
+    if (network_.GetState() == ConnectionState::DISCONNECTED && !network_.IsNonCefServer() && network_.CanAttemptConnect())
     {
         const bool can_attempt_connect = (now >= next_connect_attempt_ms_);
 
@@ -430,6 +430,9 @@ void App::HandlePacket(const NetworkPacket& packet)
         case PacketType::ServerConfig:
         {
             const auto& cfg = std::get<ServerConfigPacket>(packet.payload);
+            if (!cfg.manifest_json.empty()) {
+                resources_.OnManifestReceived(cfg.manifest_json);
+            }
             resources_.SetMasterKey(cfg.master_resource_key);
             resources_.SetResourcesLoaderUiEnabled(cfg.resources_loader_ui);
             resources_.MarkAsReadyToDownload();

@@ -49,6 +49,7 @@ void NetworkSession::Reset()
 	cef_ready_notified.store(false);
 	rx_key.clear();
 	tx_key.clear();
+	cached_join_response_raw.clear();
 	chat_input_open = false;
 
 	ClearDownloadState();

@@ -1,5 +1,6 @@
 ﻿#include "plugin.hpp"
 
+#include <algorithm>
 #include <shared/crypto.hpp>
 
 #include "cef_event_handlers.hpp"
@@ -13,8 +14,12 @@
 namespace
 {
     constexpr uint16_t DefaultListenPort = 7779;
-    constexpr int MaxJoinResponseRetries = 3;
-    constexpr int JoinResponseRetryDelaysMs[MaxJoinResponseRetries] = { 500, 1000, 1500 };
+    constexpr int MinInitTimeoutSeconds = 5;
+    constexpr int MaxInitTimeoutSeconds = 60;
+    constexpr int DefaultInitTimeoutSeconds = 15;
+    constexpr int KcpSafeMtu = 1200;
+    constexpr int MaxJoinResponseRetries = 5;
+    constexpr int JoinResponseRetryDelaysMs[MaxJoinResponseRetries] = { 400, 800, 1200, 1600, 2000 };
 
     std::string NormalizeIpAddress(std::string ip)
     {
@@ -66,6 +71,10 @@ bool CefPlugin::Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t lis
 	master_resource_key_ = options.master_resource_key;
 	min_client_version_ = options.min_client_version != 0 ? options.min_client_version : MIN_CLIENT_VERSION_U32;
 	strict_ip_check_ = options.strict_ip_check;
+	init_timeout_seconds_ = std::clamp(
+		options.init_timeout_seconds > 0 ? options.init_timeout_seconds : DefaultInitTimeoutSeconds,
+		MinInitTimeoutSeconds,
+		MaxInitTimeoutSeconds);
 	resource_download_dialogs_.SetMode(options.resources_loader_mode);
 	resource_download_dialogs_.SetDialogId(options.resources_loader_dialog_id);
 
@@ -132,11 +141,12 @@ bool CefPlugin::Initialize(std::unique_ptr<IPlatformBridge> bridge, uint16_t lis
 		});
 
 		const auto bound = network_server_->LocalEndpoint();
-		LOG_INFO("Network Server started successfully on %s:%u (min client v%s, strict_ip_check=%s).",
+		LOG_INFO("Network Server started successfully on %s:%u (min client v%s, strict_ip_check=%s, init_timeout=%ds).",
 			bound.address().to_string().c_str(),
 			static_cast<unsigned int>(bound.port()),
 			VersionToString(min_client_version_).c_str(),
-			strict_ip_check_ ? "true" : "false");
+			strict_ip_check_ ? "true" : "false",
+			init_timeout_seconds_);
 		return true;
 	}
 	catch (const std::exception& e)
@@ -258,7 +268,7 @@ void CefPlugin::OnPlayerClientInit(int playerid)
 	const std::weak_ptr<NetworkSession> weakSession = session;
 
     auto timer = std::make_shared<asio::steady_timer>(io_context_);
-    timer->expires_after(std::chrono::seconds(10));
+    timer->expires_after(std::chrono::seconds(init_timeout_seconds_));
 	timer->async_wait([this, playerid, weakSession, timer](const std::error_code& error_code)
     {
         if (error_code || !running_ || !bridge_)
@@ -330,12 +340,13 @@ void CefPlugin::OnPacketReceived(const asio::ip::udp::endpoint& from, const char
 				if (kcp_res == 0)
 				{
 					network_session->client_kcp_confirmed.store(true, std::memory_order_release);
+					network_session->cached_join_response_raw.clear();
 					receivedKcpPacket = true;
 				}
 				else if (!network_session->client_kcp_confirmed.load(std::memory_order_acquire))
 				{
 					// Client never sent a valid KCP frame yet (e.g. JoinResponse was lost
-					// on UDP and client retried/restarted). Allow raw RequestJoin recovery.
+					// on UDP and client retried HandshakeFinalize or restarted RequestJoin).
 					allowUnconfirmedRejoin = true;
 				}
 				else
@@ -360,9 +371,19 @@ void CefPlugin::OnPacketReceived(const asio::ip::udp::endpoint& from, const char
 
     // Before a transport is attached to an endpoint, the server must only accept
     // the raw packets that are correct for the current handshake state.
-    if (!network_session || allowUnconfirmedRejoin)
+    if (!network_session)
     {
         if (packet_type != PacketType::RequestJoin || !IsRequestJoinLengthValid(len))
+        {
+            return;
+        }
+    }
+    else if (allowUnconfirmedRejoin)
+    {
+        // JoinResponse may have been dropped on UDP: accept either a retried
+        // HandshakeFinalize (to immediately retransmit JoinResponse) or a fresh RequestJoin.
+        const bool is_valid_join = (packet_type == PacketType::RequestJoin && IsRequestJoinLengthValid(len));
+        if (packet_type != PacketType::HandshakeFinalize && !is_valid_join)
         {
             return;
         }
@@ -414,6 +435,9 @@ void CefPlugin::OnPacketReceived(const asio::ip::udp::endpoint& from, const char
 		case PacketType::HandshakeFinalize:
 			if (network_session && awaitingHandshakeFinalize) {
 				HandleHandshakeFinalize(from, std::get<HandshakeFinalizePacket>(packet.payload), network_session);
+			}
+			else if (network_session && allowUnconfirmedRejoin) {
+				HandleUnconfirmedHandshakeFinalize(from, std::get<HandshakeFinalizePacket>(packet.payload), network_session);
 			}
 
             break;
@@ -633,6 +657,13 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
     }
 
 	const uint32_t negotiated_client_version = session->client_version.load(std::memory_order_acquire);
+	const bool deliver_manifest_over_kcp = (negotiated_client_version >= KCP_MANIFEST_MIN_VERSION_U32);
+
+	std::string manifest_json;
+	nlohmann::json manifest = resource_->GetManifestAsJson();
+	if (!manifest.is_null()) {
+		manifest_json = manifest.dump();
+	}
 
 	JoinResponsePacket join_response;
 	join_response.accepted = true;
@@ -641,11 +672,12 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
     join_response.server_version = PLUGIN_VERSION_U32;
     join_response.client_version = negotiated_client_version != 0 ? negotiated_client_version : PLUGIN_VERSION_U32;
     join_response.message.clear();
-
-	nlohmann::json manifest = resource_->GetManifestAsJson();
-	if (!manifest.is_null()) {
-		join_response.manifest_json = manifest.dump();
+	if (!deliver_manifest_over_kcp) {
+		join_response.manifest_json = manifest_json;
 	}
+
+	std::string cached_join_response_raw;
+	SerializePacket(NetworkPacket{ PacketType::JoinResponse, join_response }, cached_join_response_raw);
 
 	if (!IsSessionCurrent(session, epoch))
 		return;
@@ -659,10 +691,12 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
 		{
 			session->rx_key = std::move(session_keys->rx);
 			session->tx_key = std::move(session_keys->tx);
+			session->cached_join_response_raw = std::move(cached_join_response_raw);
 			session->kcp_instance = ikcp_create(session->playerid, session.get());
 			if (session->kcp_instance)
 			{
 				session->kcp_instance->output = kcp_output_callback;
+				ikcp_setmtu(session->kcp_instance, KcpSafeMtu);
 				ikcp_nodelay(session->kcp_instance, 1, 10, 2, 1);
 				ikcp_wndsize(session->kcp_instance, 256, 256);
 				session->handshake_status = HandshakeStatus::CONNECTED;
@@ -690,6 +724,9 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
 	ServerConfigPacket config_packet;
 	config_packet.master_resource_key = master_resource_key_;
     config_packet.resources_loader_ui = resource_download_dialogs_.UsesClientLoader();
+	if (deliver_manifest_over_kcp) {
+		config_packet.manifest_json = std::move(manifest_json);
+	}
 	SendPacketToSession(session, PacketType::ServerConfig, config_packet);
 
 	if (!IsSessionCurrent(session, epoch))
@@ -703,8 +740,49 @@ void CefPlugin::HandleHandshakeFinalize(const asio::ip::udp::endpoint& from,
 
     NotifyCefInitialize(session, true, CEF_INIT_OK, "");
 
-    LOG_INFO("Network handshake for player %d is complete (client=v%s).",
-        session->playerid, VersionToString(negotiated_client_version).c_str());
+    LOG_INFO("Network handshake for player %d is complete (client=v%s, manifest_via=%s).",
+        session->playerid,
+        VersionToString(negotiated_client_version).c_str(),
+        deliver_manifest_over_kcp ? "kcp" : "raw-udp");
+}
+
+void CefPlugin::HandleUnconfirmedHandshakeFinalize(
+	const asio::ip::udp::endpoint& from,
+	const HandshakeFinalizePacket& finalize_packet,
+	const std::shared_ptr<NetworkSession>& session)
+{
+	if (!session || !running_ || !network_server_)
+		return;
+
+	if (!security_->ValidateCookie(from, finalize_packet.cookie))
+		return;
+
+	std::string cached_raw;
+	{
+		std::lock_guard<std::mutex> lock(session->kcp_mutex);
+		if (session->handshake_status != HandshakeStatus::CONNECTED ||
+			session->address != from ||
+			session->client_kcp_confirmed.load(std::memory_order_acquire) ||
+			session->cached_join_response_raw.empty())
+		{
+			return;
+		}
+
+		cached_raw = session->cached_join_response_raw;
+	}
+
+	LOG_DEBUG("Received retried HandshakeFinalize for pid=%d before KCP confirmation -> resending JoinResponse",
+		session->playerid);
+
+	network_server_->SendTo(from, cached_raw.data(), static_cast<int>(cached_raw.size()));
+
+	{
+		std::lock_guard<std::mutex> lock(session->kcp_mutex);
+		if (session->kcp_instance && session->handshake_status == HandshakeStatus::CONNECTED)
+		{
+			ikcp_flush(session->kcp_instance);
+		}
+	}
 }
 
 void CefPlugin::ScheduleJoinResponseRetry(

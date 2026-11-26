@@ -48,6 +48,7 @@ public:
 	void SendBrowserCreateResult(int browserId, bool success, int code, const std::string& reason);
 
 	bool IsNonCefServer() const { return non_cef_server_.load(); }
+	bool CanAttemptConnect() const;
 
 	using SessionActiveHandler = std::function<void(bool)>;
 	void SetSessionActiveHandler(SessionActiveHandler handler);
@@ -100,14 +101,19 @@ private:
 	std::mutex handler_mutex_;
 
 	int query_attempts_ = 0;
-	static constexpr int MAX_QUERY_ATTEMPTS = 2;
+	static constexpr int MAX_QUERY_ATTEMPTS = 3;
 
 	int join_attempts_ = 0;
-	static constexpr int MAX_JOIN_ATTEMPTS = 5;
+	static constexpr int MAX_JOIN_ATTEMPTS = 8;
 
 	int finalize_attempts_ = 0;
-	static constexpr int MAX_FINALIZE_ATTEMPTS = 3;
+	static constexpr int MAX_FINALIZE_ATTEMPTS = 5;
 	HandshakeFinalizePacket pending_finalize_pkt_{};
+
+	int failed_join_cycles_ = 0;
+	static constexpr int MAX_FAILED_JOIN_CYCLES = 2;
+	std::atomic<uint64_t> reconnect_backoff_until_ms_{ 0 };
+	bool logged_unexpected_endpoint_ = false;
 
 	std::atomic<bool> non_cef_server_{ false };
 

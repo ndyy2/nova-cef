@@ -89,6 +89,10 @@ struct ServerConfigPacket
 
 	// When false, the client will download resources silently (no internal loader UI)
 	bool resources_loader_ui = true;
+
+	// Optional resource manifest delivered reliably over KCP for clients v1.4.3+
+	// so raw UDP JoinResponse stays small and avoids IP/MTU fragmentation.
+	std::string manifest_json;
 };
 
 struct RequestFilesPacket

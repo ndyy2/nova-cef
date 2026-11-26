@@ -28,6 +28,7 @@ struct CefPluginOptions
 	std::string bind_address = {};
 	uint32_t min_client_version = MIN_CLIENT_VERSION_U32;
 	bool strict_ip_check = true;
+	int init_timeout_seconds = 15;
 };
 
 struct RegisteredEvent
@@ -94,6 +95,7 @@ public:
 private:
 	void HandleRequestJoin(const asio::ip::udp::endpoint& from, const RequestJoinPacket& packet);
 	void HandleHandshakeFinalize(const asio::ip::udp::endpoint& from, const HandshakeFinalizePacket& finalize_packet, std::shared_ptr<NetworkSession> session);
+	void HandleUnconfirmedHandshakeFinalize(const asio::ip::udp::endpoint& from, const HandshakeFinalizePacket& finalize_packet, const std::shared_ptr<NetworkSession>& session);
 	void ScheduleJoinResponseRetry(const std::shared_ptr<NetworkSession>& session, uint64_t epoch, const asio::ip::udp::endpoint& endpoint, JoinResponsePacket join_response, int attempt);
 	void HandleKcpInput(std::shared_ptr<NetworkSession> session);
 	void SendPacketToSession(const std::shared_ptr<NetworkSession>& session, PacketType type, const PacketPayload& payload);
@@ -116,6 +118,7 @@ private:
 	std::vector<uint8_t> master_resource_key_;
 	uint32_t min_client_version_ = MIN_CLIENT_VERSION_U32;
 	bool strict_ip_check_ = true;
+	int init_timeout_seconds_ = 15;
 	struct PlayerUiState
 	{
 		bool spawnScreenVisible = true;

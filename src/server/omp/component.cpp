@@ -231,6 +231,8 @@ void CefOmpComponent::onInit(IComponentList* components)
         bind_address_ = ResolveBindAddress(config);
         min_client_version_ = ResolveMinClientVersion(config, *core_, true);
         strict_ip_check_ = config.getBool("cef.strict_ip_check") ? *config.getBool("cef.strict_ip_check") : true;
+        int* init_timeout_ptr = config.getInt("cef.init_timeout");
+        init_timeout_seconds_ = (init_timeout_ptr && *init_timeout_ptr > 0) ? *init_timeout_ptr : 15;
         debug_enabled_ = config.getBool("cef.debug") ? *config.getBool("cef.debug") : false;
 
         StringView key_sv = config.getString("cef.master_resource_key");
@@ -253,6 +255,7 @@ void CefOmpComponent::onInit(IComponentList* components)
     options.bind_address = bind_address_;
     options.min_client_version = min_client_version_;
     options.strict_ip_check = strict_ip_check_;
+    options.init_timeout_seconds = init_timeout_seconds_;
 
     auto bridge = CreateOmpPlatformBridge(core_, pawn_);
     if (!plugin_->Initialize(std::move(bridge), cef_network_port_, options))
@@ -330,6 +333,7 @@ void CefOmpComponent::provideConfiguration(ILogger& logger, IEarlyConfig& config
 		config.setString("cef.bind", "");
 		config.setString("cef.min_client_version", "1.3.0");
 		config.setBool("cef.strict_ip_check", true);
+		config.setInt("cef.init_timeout", 15);
         config.setString("cef.resources_loader_mode", "cef");
         config.setInt("cef.resources_loader_dialog_id", ResourceDownloadDialogManager::DefaultDialogId);
 	}
@@ -358,6 +362,10 @@ void CefOmpComponent::provideConfiguration(ILogger& logger, IEarlyConfig& config
 			config.setBool("cef.strict_ip_check", true);
 		}
 
+		if (config.getType("cef.init_timeout") == ConfigOptionType_None) {
+			config.setInt("cef.init_timeout", 15);
+		}
+
         if (config.getType("cef.resources_loader_mode") == ConfigOptionType_None &&
             config.getType("cef.resources_loader_ui") == ConfigOptionType_None) {
             config.setString("cef.resources_loader_mode", "cef");
@@ -379,6 +387,8 @@ void CefOmpComponent::provideConfiguration(ILogger& logger, IEarlyConfig& config
     bind_address_ = ResolveBindAddress(config);
     min_client_version_ = ResolveMinClientVersion(config, logger, false);
     strict_ip_check_ = config.getBool("cef.strict_ip_check") ? *config.getBool("cef.strict_ip_check") : true;
+    int* init_timeout_ptr = config.getInt("cef.init_timeout");
+    init_timeout_seconds_ = (init_timeout_ptr && *init_timeout_ptr > 0) ? *init_timeout_ptr : 15;
 	debug_enabled_ = config.getBool("cef.debug") ? *config.getBool("cef.debug") : false;
 
 	StringView key_sv = config.getString("cef.master_resource_key");

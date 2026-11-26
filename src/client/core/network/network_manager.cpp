@@ -12,9 +12,23 @@
 #include "shared/query_port.hpp"
 #include "shared/version.hpp"
 
-constexpr int PORT_QUERY_RETRY_INTERVAL_MS = 350;
-constexpr int CONNECT_RETRY_INTERVAL_MS = 2000;
+#ifdef _WIN32
+#include <winsock2.h>
+#include <mswsock.h>
+#endif
+
+constexpr int PORT_QUERY_RETRY_INTERVAL_MS = 500;
+constexpr int CONNECT_RETRY_INTERVAL_MS = 1000;
 constexpr int KCP_UPDATE_INTERVAL_MS = 10;
+constexpr int KCP_SAFE_MTU = 1200;
+constexpr uint64_t RECONNECT_BACKOFF_MS = 2000;
+
+static uint64_t SteadyNowMs()
+{
+	return static_cast<uint64_t>(
+		std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 static int kcp_client_output_callback(const char* buf, int len, ikcpcb* /*kcp*/, void* user)
 {
@@ -39,6 +53,11 @@ void NetworkManager::SetSessionActiveHandler(SessionActiveHandler handler)
     session_handler_ = std::move(handler);
 }
 
+bool NetworkManager::CanAttemptConnect() const
+{
+	return SteadyNowMs() >= reconnect_backoff_until_ms_.load(std::memory_order_acquire);
+}
+
 bool NetworkManager::Initialize(const std::string& ip, unsigned short port)
 {
 	return Initialize(ip, 0, port);
@@ -48,10 +67,21 @@ bool NetworkManager::Initialize(const std::string& ip, unsigned short game_port,
 {
 	try {
 		SecurityManager::Initialize();
-		asio::ip::udp::resolver resolver(io_context_);
-		const unsigned short resolve_port = game_port != 0 ? game_port : fallback_cef_port;
-		auto resolved = *resolver.resolve(asio::ip::udp::v4(), ip, std::to_string(resolve_port)).begin();
-		const auto addr = resolved.endpoint().address();
+
+		asio::ip::address addr;
+		asio::error_code parse_ec;
+		auto ipv4 = asio::ip::make_address_v4(ip, parse_ec);
+		if (!parse_ec)
+		{
+			addr = ipv4;
+		}
+		else
+		{
+			asio::ip::udp::resolver resolver(io_context_);
+			const unsigned short resolve_port = game_port != 0 ? game_port : fallback_cef_port;
+			auto resolved = *resolver.resolve(asio::ip::udp::v4(), ip, std::to_string(resolve_port)).begin();
+			addr = resolved.endpoint().address();
+		}
 
 		game_endpoint_ = game_port != 0
 			? asio::ip::udp::endpoint(addr, game_port)
@@ -65,6 +95,8 @@ bool NetworkManager::Initialize(const std::string& ip, unsigned short game_port,
 	}
 
 	non_cef_server_.store(false);
+	failed_join_cycles_ = 0;
+	reconnect_backoff_until_ms_.store(0, std::memory_order_release);
 	FireSessionActive(false);
 
 	if (game_endpoint_.port() != 0)
@@ -123,6 +155,7 @@ void NetworkManager::Connect(int playerid)
 	query_attempts_ = 0;
 	join_attempts_ = 0;
 	finalize_attempts_ = 0;
+	logged_unexpected_endpoint_ = false;
 
 	LOG_INFO("[CLIENT] Connecting to server for playerid {}...", playerid_);
 
@@ -132,6 +165,22 @@ void NetworkManager::Connect(int playerid)
 		asio::error_code ec;
 		socket_.open(asio::ip::udp::v4(), ec);
 		if (ec) throw std::runtime_error("Socket open failed: " + ec.message());
+#ifdef _WIN32
+		{
+			BOOL new_behavior = FALSE;
+			DWORD bytes_returned = 0;
+			::WSAIoctl(
+				socket_.native_handle(),
+				SIO_UDP_CONNRESET,
+				&new_behavior,
+				sizeof(new_behavior),
+				nullptr,
+				0,
+				&bytes_returned,
+				nullptr,
+				nullptr);
+		}
+#endif
 		socket_.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), 0), ec);
 		if (ec) throw std::runtime_error("Socket bind failed: " + ec.message());
 
@@ -280,8 +329,19 @@ void NetworkManager::DoSendRequestJoin()
 	join_attempts_++;
 	if (join_attempts_ > MAX_JOIN_ATTEMPTS)
 	{
-		LOG_WARN("[CLIENT] No handshake after {} attempts -> assuming non-CEF server. Disconnecting.", MAX_JOIN_ATTEMPTS);
-		non_cef_server_.store(true);
+		failed_join_cycles_++;
+		if (failed_join_cycles_ >= MAX_FAILED_JOIN_CYCLES)
+		{
+			LOG_WARN("[CLIENT] No handshake after {} attempts ({} cycles) -> assuming non-CEF server. Disconnecting.",
+				MAX_JOIN_ATTEMPTS, failed_join_cycles_);
+			non_cef_server_.store(true);
+		}
+		else
+		{
+			LOG_WARN("[CLIENT] No handshake after {} attempts (cycle {}/{}) -> backing off {}ms before retrying.",
+				MAX_JOIN_ATTEMPTS, failed_join_cycles_, MAX_FAILED_JOIN_CYCLES, RECONNECT_BACKOFF_MS);
+			reconnect_backoff_until_ms_.store(SteadyNowMs() + RECONNECT_BACKOFF_MS, std::memory_order_release);
+		}
 		Disconnect();
 		return;
 	}
@@ -309,6 +369,7 @@ void NetworkManager::DoSendHandshakeFinalize()
 	if (finalize_attempts_ > MAX_FINALIZE_ATTEMPTS)
 	{
 		LOG_WARN("[CLIENT] No JoinResponse after {} HandshakeFinalize attempts -> disconnecting to retry.", MAX_FINALIZE_ATTEMPTS);
+		reconnect_backoff_until_ms_.store(SteadyNowMs() + 1000ULL, std::memory_order_release);
 		Disconnect();
 		return;
 	}
@@ -349,6 +410,14 @@ void NetworkManager::DoReceive()
 				}
 				else if (remote_endpoint_ == server_endpoint_) {
 					HandleRawMessage(recv_buffer_.data(), bytes_recvd);
+				}
+				else if (!logged_unexpected_endpoint_ &&
+					(state_ == ConnectionState::SENDING_JOIN || state_ == ConnectionState::AWAITING_ACCEPTANCE)) {
+					logged_unexpected_endpoint_ = true;
+					LOG_WARN("[CLIENT] Ignored UDP packet ({} bytes) from unexpected endpoint {}:{} (expected {}:{}).",
+						bytes_recvd,
+						remote_endpoint_.address().to_string().c_str(), remote_endpoint_.port(),
+						server_endpoint_.address().to_string().c_str(), server_endpoint_.port());
 				}
 			}
 			if (state_ != ConnectionState::DISCONNECTED) {
@@ -454,12 +523,15 @@ void NetworkManager::HandleRawMessage(const char* data, size_t len)
 			LOG_INFO("[CLIENT] Join accepted! Initializing KCP with conv id {}.", response.kcp_conv_id);
 
 			non_cef_server_.store(false);
+			failed_join_cycles_ = 0;
+			reconnect_backoff_until_ms_.store(0, std::memory_order_release);
 			FireSessionActive(true);
 
 			{
 				std::lock_guard<std::mutex> lock(kcp_mutex_);
 				kcp_instance_ = ikcp_create(response.kcp_conv_id, this);
 				kcp_instance_->output = kcp_client_output_callback;
+				ikcp_setmtu(kcp_instance_, KCP_SAFE_MTU);
 				ikcp_nodelay(kcp_instance_, 1, 10, 2, 1);
 				ikcp_wndsize(kcp_instance_, 128, 128);
 			}
@@ -475,7 +547,9 @@ void NetworkManager::HandleRawMessage(const char* data, size_t len)
 				resource_.OnConnect(netGame->GetIp(), netGame->GetPort());
 			}
 
-			resource_.OnManifestReceived(response.manifest_json);
+			if (!response.manifest_json.empty()) {
+				resource_.OnManifestReceived(response.manifest_json);
+			}
 
 			state_ = ConnectionState::CONNECTED;
 

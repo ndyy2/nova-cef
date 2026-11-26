@@ -186,9 +186,17 @@ void ResourceManager::SetMasterKey(const std::vector<uint8_t>& key)
 
 void ResourceManager::OnManifestReceived(const std::string& manifestJson)
 {
+	if (manifestJson.empty())
+		return;
+
 	try {
-		server_manifest_ = nlohmann::json::parse(manifestJson);
-		LOG_DEBUG("[ResourceManager] Manifest received with {} resources", server_manifest_.size());
+		nlohmann::json parsed = nlohmann::json::parse(manifestJson);
+		size_t count = parsed.size();
+		{
+			std::lock_guard<std::mutex> lock(download_mutex_);
+			server_manifest_ = std::move(parsed);
+		}
+		LOG_DEBUG("[ResourceManager] Manifest received with {} resources", count);
 	}
 	catch (const std::exception& e) {
 		LOG_ERROR("[ResourceManager] Failed to parse manifest: {}", e.what());
@@ -233,7 +241,11 @@ void ResourceManager::TriggerDownload()
 	std::vector<FileProgressData> progress_list;
 	std::map<std::string, ExpectedFile> expected_files;
 
-	const nlohmann::json manifest = server_manifest_.is_object() ? server_manifest_ : nlohmann::json::object();
+	nlohmann::json manifest;
+	{
+		std::lock_guard<std::mutex> lock(download_mutex_);
+		manifest = server_manifest_.is_object() ? server_manifest_ : nlohmann::json::object();
+	}
 
 	for (const auto& [resourceName, files] : manifest.items()) {
 		if (!files.is_array()) {

@@ -6,7 +6,7 @@
 
 #define VERSION_MAJOR 1
 #define VERSION_MINOR 4
-#define VERSION_PATCH 2
+#define VERSION_PATCH 3
 #define VERSION_BUILD 0
 
 #define MIN_CLIENT_VERSION_MAJOR 1
@@ -27,6 +27,9 @@ static constexpr uint32_t MIN_CLIENT_VERSION_U32 =
 
 static constexpr uint32_t BROWSER_LAYER_MIN_VERSION_U32 =
     MakeVersionU32(1, 4, 0, 0);
+
+static constexpr uint32_t KCP_MANIFEST_MIN_VERSION_U32 =
+    MakeVersionU32(1, 4, 3, 0);
 
 static constexpr bool IsClientVersionSupported(uint32_t client_version, uint32_t min_version = MIN_CLIENT_VERSION_U32)
 {

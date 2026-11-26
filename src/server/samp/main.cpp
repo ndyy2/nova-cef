@@ -104,6 +104,7 @@ PLUGIN_EXPORT bool PLUGIN_CALL Load(void** ppData)
         : config.GetString("bind", "");
 
     const bool strict_ip_check = config.GetInt("cef_strict_ip_check", 1) != 0;
+    const int init_timeout_seconds = config.GetInt("cef_init_timeout", 15);
 
     uint32_t min_client_version = MIN_CLIENT_VERSION_U32;
     const std::string min_ver_str = config.GetString("cef_min_client_version", "1.3.0");
@@ -157,6 +158,7 @@ PLUGIN_EXPORT bool PLUGIN_CALL Load(void** ppData)
     options.bind_address = bind_address;
     options.min_client_version = min_client_version;
     options.strict_ip_check = strict_ip_check;
+    options.init_timeout_seconds = init_timeout_seconds;
 
     auto bridge = CreateSampPlatformBridge();
     if (!plugin_->Initialize(std::move(bridge), cef_network_port, options))

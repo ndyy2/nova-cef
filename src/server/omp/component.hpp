@@ -56,6 +56,7 @@ private:
     std::string bind_address_;
     uint32_t min_client_version_ = MIN_CLIENT_VERSION_U32;
     bool strict_ip_check_ = true;
+    int init_timeout_seconds_ = 15;
 
     uint16_t server_port_ = 7777;
     uint16_t cef_network_port_ = 7779;

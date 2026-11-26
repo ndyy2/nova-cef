@@ -58,6 +58,7 @@ struct NetworkSession
 
 	std::vector<uint8_t> rx_key;
 	std::vector<uint8_t> tx_key;
+	std::string cached_join_response_raw;
 
 	std::function<void(const asio::ip::udp::endpoint&, const char*, int)> send_fn;
 

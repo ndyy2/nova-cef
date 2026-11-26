@@ -6,11 +6,44 @@ inline constexpr uint32_t kMaxCookieBytes = 64; // encrypted IPv4 + port, nonce 
 inline constexpr uint32_t kMaxPublicKeyBytes = 32; // crypto_kx_PUBLICKEYBYTES
 inline constexpr uint32_t kMaxResourceKeyBytes = 64;
 inline constexpr uint32_t kMaxFileChunkBytes = 64 * 1024;
+inline constexpr uint32_t kMaxManifestBytes = 256 * 1024;
 
 static inline size_t RemainingBytes(std::istream& is)
 {
 	const std::streamsize available = is.rdbuf() ? is.rdbuf()->in_avail() : 0;
 	return available > 0 ? static_cast<size_t>(available) : 0;
+}
+
+static inline void WriteLongString(std::ostream& os, const std::string& str, uint32_t max_length)
+{
+	uint32_t length = static_cast<uint32_t>(std::min<size_t>(str.length(), max_length));
+	os.write(reinterpret_cast<const char*>(&length), sizeof(length));
+	if (length > 0) {
+		os.write(str.data(), length);
+	}
+}
+
+static inline bool ReadLongString(std::istream& is, std::string& str, uint32_t max_length)
+{
+	uint32_t length = 0;
+	is.read(reinterpret_cast<char*>(&length), sizeof(length));
+	if (is.gcount() != sizeof(length))
+		return false;
+
+	if (length > max_length || length > RemainingBytes(is))
+		return false;
+
+	if (length > 0) {
+		str.resize(length);
+		is.read(&str[0], length);
+		if (is.gcount() != static_cast<std::streamsize>(length))
+			return false;
+	}
+	else {
+		str.clear();
+	}
+
+	return true;
 }
 
 static inline void WriteString(std::ostream& os, const std::string& str)
@@ -123,6 +156,9 @@ inline bool SerializePacket(const NetworkPacket& packet, std::string& out)
 			else if constexpr (std::is_same_v<T, ServerConfigPacket>) {
 				WriteBytes(os, arg.master_resource_key);
 				os.put(arg.resources_loader_ui ? 1 : 0);
+				if (!arg.manifest_json.empty()) {
+					WriteLongString(os, arg.manifest_json, kMaxManifestBytes);
+				}
 			}
 			else if constexpr (std::is_same_v<T, RequestFilesPacket>) {
 				uint16_t count = static_cast<uint16_t>(arg.files.size());
@@ -318,6 +354,12 @@ inline bool DeserializePacket(const char* data, size_t size, NetworkPacket& out)
 				return false;
 
 			packet.resources_loader_ui = (b != 0);
+			packet.manifest_json.clear();
+
+			if (RemainingBytes(is) >= sizeof(uint32_t)) {
+				if (!ReadLongString(is, packet.manifest_json, kMaxManifestBytes))
+					return false;
+			}
 
 			out.payload = packet;
 			break;
