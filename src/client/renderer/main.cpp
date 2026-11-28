@@ -8,13 +8,20 @@
 #include <variant>
 #include <vector>
 
+struct EventCallback
+{
+    CefRefPtr<CefV8Context> context;
+    CefRefPtr<CefV8Value> function;
+};
+
 // Global map to store event names and their callback functions
-static std::map<std::string, std::vector<CefRefPtr<CefV8Value>>> events_;
+static std::map<std::string, std::vector<EventCallback>> events_;
 
 // Queue events that arrive before JS registers a handler (fixes race between server emit and cef.on)
 using PendingArg  = std::variant<std::monostate, bool, int, double, CefString>;
 using PendingArgs = std::vector<PendingArg>;
 static std::map<std::string, std::vector<PendingArgs>> pending_events_;
+static constexpr size_t kMaxPendingEventsPerName = 256;
 
 static bool g_chat_input_open = false;
 
@@ -95,16 +102,23 @@ static void FlushPendingEvents(const std::string& eventName)
     if (it == events_.end() || it->second.empty()) 
         return;
 
-    for (const auto& pending : pit->second)
+    // Move out first so callbacks calling cef.on/cef.off cannot invalidate iterators.
+    auto queued = std::move(pit->second);
+    pending_events_.erase(pit);
+
+    auto callbacks = it->second;
+    for (const auto& pending : queued)
     {
-        CefV8ValueList jsArgs = BuildJsArgs(pending);
-        for (const auto& cb : it->second)
+        for (const auto& cb : callbacks)
         {
-            if (cb) cb->ExecuteFunction(nullptr, jsArgs);
+            if (!cb.context || !cb.function || !cb.context->Enter())
+                continue;
+
+            CefV8ValueList jsArgs = BuildJsArgs(pending);
+            cb.function->ExecuteFunction(nullptr, jsArgs);
+            cb.context->Exit();
         }
     }
-
-    pending_events_.erase(pit);
 }
 
 class V8HandlerImpl : public CefV8Handler
@@ -183,6 +197,11 @@ public:
                 return true;
             }
 
+            CefRefPtr<CefV8Context> context = CefV8Context::GetCurrentContext();
+            CefRefPtr<CefFrame> frame = context ? context->GetFrame() : nullptr;
+            if (!frame || !frame->IsValid())
+                return true;
+
             CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("emit_event");
             CefRefPtr<CefListValue> list = msg->GetArgumentList();
             list->SetString(0, arguments[0]->GetStringValue());
@@ -195,6 +214,8 @@ public:
                     list->SetBool(i, arg->GetBoolValue());
                 else if (arg->IsInt())
                     list->SetInt(i, arg->GetIntValue());
+                else if (arg->IsUInt())
+                    list->SetDouble(i, static_cast<double>(arg->GetUIntValue()));
                 else if (arg->IsDouble())
                     list->SetDouble(i, arg->GetDoubleValue());
                 else if (arg->IsString())
@@ -203,7 +224,7 @@ public:
                     list->SetNull(i);
             }
 
-            CefV8Context::GetCurrentContext()->GetFrame()->SendProcessMessage(PID_BROWSER, msg);
+            frame->SendProcessMessage(PID_BROWSER, msg);
             return true;
         }
         else if (name == "on")
@@ -214,11 +235,15 @@ public:
                 return true;
             }
 
+            CefRefPtr<CefV8Context> context = CefV8Context::GetCurrentContext();
+            if (!context)
+                return true;
+
             const std::string eventName = arguments[0]->GetStringValue();
             CefRefPtr<CefV8Value> callback = arguments[1];
 
-            // Store the callback function to be called later
-            events_[eventName].push_back(callback);
+            // Store the callback function and its owning V8 context
+            events_[eventName].push_back(EventCallback{ context, callback });
 
             // Flush queued events for this eventName (if any)
             FlushPendingEvents(eventName);
@@ -268,8 +293,8 @@ public:
                 auto& vec = it->second;
                 vec.erase(
                     std::remove_if(vec.begin(), vec.end(),
-                        [&](const CefRefPtr<CefV8Value>& cb) {
-                            return cb && cb->IsSame(callback);
+                        [&](const EventCallback& cb) {
+                            return cb.function && cb.function->IsSame(callback);
                         }),
                     vec.end()
                 );
@@ -291,13 +316,18 @@ public:
                 return true;
             }
 
+            CefRefPtr<CefV8Context> context = CefV8Context::GetCurrentContext();
+            CefRefPtr<CefFrame> frame = context ? context->GetFrame() : nullptr;
+            if (!frame || !frame->IsValid())
+                return true;
+
             const bool hasFocus = arguments[0]->GetBoolValue();
 
             CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("cef_set_focus");
             CefRefPtr<CefListValue> list = msg->GetArgumentList();
             list->SetBool(0, hasFocus);
 
-            CefV8Context::GetCurrentContext()->GetFrame()->SendProcessMessage(PID_BROWSER, msg);
+            frame->SendProcessMessage(PID_BROWSER, msg);
             return true;
         }
         else if (name == "isChatInputOpen")
@@ -307,9 +337,13 @@ public:
         }
         else if (name == "exitGame")
         {
-            CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("cef_exit_game");
+            CefRefPtr<CefV8Context> context = CefV8Context::GetCurrentContext();
+            CefRefPtr<CefFrame> frame = context ? context->GetFrame() : nullptr;
+            if (!frame || !frame->IsValid())
+                return true;
 
-            CefV8Context::GetCurrentContext()->GetFrame()->SendProcessMessage(PID_BROWSER, msg);
+            CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("cef_exit_game");
+            frame->SendProcessMessage(PID_BROWSER, msg);
             return true;
         }
 
@@ -355,6 +389,28 @@ public:
                            CefRefPtr<CefV8Context> context) override
     {
         CEF_REQUIRE_RENDERER_THREAD();
+
+        // Release all V8 callbacks owned by this context to prevent memory leaks and
+        // stale V8 function execution across reloads/navigations.
+        for (auto it = events_.begin(); it != events_.end(); )
+        {
+            auto& vec = it->second;
+            vec.erase(
+                std::remove_if(vec.begin(), vec.end(),
+                    [&](const EventCallback& cb) {
+                        return !cb.context || !cb.function || cb.context->IsSame(context);
+                    }),
+                vec.end()
+            );
+
+            if (vec.empty())
+                it = events_.erase(it);
+            else
+                ++it;
+        }
+
+        if (frame && frame->IsMain())
+            pending_events_.clear();
 
         if (!browser)
             return;
@@ -435,45 +491,30 @@ public:
                 g_chat_input_open = args->GetBool(1);
             }
 
-            CefV8ValueList jsArgs;
-            for (size_t i = 1; i < args->GetSize(); ++i)
-            {
-                switch (args->GetType(i))
-                {
-                    case VTYPE_INT:    
-                        jsArgs.push_back(CefV8Value::CreateInt(args->GetInt(i))); 
-                        break;
-                    case VTYPE_DOUBLE: 
-                        jsArgs.push_back(CefV8Value::CreateDouble(args->GetDouble(i))); 
-                        break;
-                    case VTYPE_BOOL:   
-                        jsArgs.push_back(CefV8Value::CreateBool(args->GetBool(i))); 
-                        break;
-                    case VTYPE_STRING: 
-                        jsArgs.push_back(CefV8Value::CreateString(args->GetString(i))); 
-                        break;
-                    default:           
-                        jsArgs.push_back(CefV8Value::CreateNull()); 
-                        break;
-                }
-            }
-
             auto it = events_.find(eventName);
             const bool hasHandler = (it != events_.end() && !it->second.empty());
 
-            CefRefPtr<CefV8Context> context = frame->GetV8Context();
-            if (!hasHandler || !context || !context->Enter())
+            if (!hasHandler)
             {
-                pending_events_[eventName].push_back(CapturePendingArgs(args));
+                auto& queue = pending_events_[eventName];
+                if (queue.size() < kMaxPendingEventsPerName)
+                    queue.push_back(CapturePendingArgs(args));
                 return true;
             }
 
-            for (const auto& cb : it->second)
+            // Snapshot callbacks so handlers calling cef.on/cef.off cannot invalidate iterators.
+            auto callbacks = it->second;
+            const PendingArgs captured = CapturePendingArgs(args);
+            for (const auto& cb : callbacks)
             {
-                if (cb) cb->ExecuteFunction(nullptr, jsArgs);
+                if (!cb.context || !cb.function || !cb.context->Enter())
+                    continue;
+
+                CefV8ValueList cbArgs = BuildJsArgs(captured);
+                cb.function->ExecuteFunction(nullptr, cbArgs);
+                cb.context->Exit();
             }
 
-            context->Exit();
             return true;
         }
 
@@ -483,13 +524,18 @@ public:
     IMPLEMENT_REFCOUNTING(RenderProcessHandler);
 };
 
-class RendererApp : public CefApp, public CefRenderProcessHandler
+class RendererApp : public CefApp
 {
 public:
+    RendererApp() : render_handler_(new RenderProcessHandler()) {}
+
     CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override
     {
-        return new RenderProcessHandler();
+        return render_handler_;
     }
+
+private:
+    CefRefPtr<RenderProcessHandler> render_handler_;
 
     IMPLEMENT_REFCOUNTING(RendererApp);
 };

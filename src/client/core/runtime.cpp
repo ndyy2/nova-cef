@@ -114,6 +114,9 @@ bool Runtime::Start()
         if (gta_)
             gta_->PumpMainThreadCallbacks();
 
+        if (wndproc_)
+            wndproc_->EnsureInstalled();
+
 		UpdateBrowserDrawState();
 
         int frames = cursor_recenter_frames_.load(std::memory_order_acquire);

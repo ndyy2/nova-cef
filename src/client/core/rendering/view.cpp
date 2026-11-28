@@ -20,7 +20,7 @@ void View::InternalCreateTexture(int width, int height)
         return;
     }
 
-    wrapper_ = std::make_unique<ViewTexture>(device_, width, height);
+    wrapper_ = std::make_unique<ViewTexture>(device_, width, height, false);
     width_ = width;
     height_ = height;
 }
@@ -42,26 +42,18 @@ void View::Resize(int width, int height)
     InternalCreateTexture(std::max(1, width), std::max(1, height));
 }
 
-void View::UpdateTexture(const uint8_t* data, const cef_rect_t* dirtyRects, size_t count)
+void View::UpdateTexture(const uint8_t* data, int bufferWidth, int bufferHeight, const cef_rect_t* dirtyRects, size_t count)
 {
-    if (!wrapper_ || !data) 
+    if (!wrapper_ || !data || bufferWidth <= 0 || bufferHeight <= 0) 
         return;
 
-    if (count == 0 || !dirtyRects) 
+    if (bufferWidth != width_ || bufferHeight != height_)
     {
-        LOG_DEBUG("[View] No dirty rects provided, performing full update");
-        wrapper_->Update(data, width_, height_, false);
-        return;
+        width_ = bufferWidth;
+        height_ = bufferHeight;
     }
 
-    for (size_t i = 0; i < count; ++i)
-    {
-        const auto& r = dirtyRects[i];
-        if (r.width <= 0 || r.height <= 0) 
-            continue;
-
-        wrapper_->UpdatePartial(data, width_, height_, r.x, r.y, r.width, r.height, false);
-    }
+    wrapper_->UpdateDirtyRects(data, bufferWidth, bufferHeight, dirtyRects, count, false);
 }
 
 void View::OnPaint(const void* buffer, int width, int height)

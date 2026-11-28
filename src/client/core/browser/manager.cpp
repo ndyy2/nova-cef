@@ -33,6 +33,7 @@ static void ConfigureBrowserSettings(CefBrowserSettings& settings)
     settings.remote_fonts = STATE_ENABLED;
     settings.webgl = STATE_ENABLED;
     settings.tab_to_links = STATE_DISABLED;
+    settings.windowless_frame_rate = 60;
 }
 
 static uint32_t GetCefEventFlags()
@@ -286,10 +287,13 @@ bool BrowserManager::Initialize()
     CefString(&settings.locales_dir_path) = cef_locales_dir.wstring();
 
     settings.no_sandbox = true;
-    settings.log_severity = LOGSEVERITY_INFO;
+    settings.log_severity = LOGSEVERITY_WARNING;
     settings.multi_threaded_message_loop = true;
     settings.windowless_rendering_enabled = true;
     settings.persist_session_cookies = true;
+
+    if (DefaultCefApp::IsRunningUnderWine())
+        LOG_INFO("[CEF] Wine environment detected -> enabling Wine stability flags (software OSR compositing).");
 
     int exit_code = CefExecuteProcess(main_args, app.get(), nullptr);
     if (exit_code >= 0)
@@ -560,12 +564,13 @@ void BrowserManager::Shutdown()
 
     screen_capture_.StopAll();
     screen_capture_.OnDeviceLost();
+    ReleaseStateBlock();
 
     {
         BrowsersLock lock(browsers_mutex_);
-        pending_.clear();
         player_stats_poll_.clear();
         entityToBrowserId_.clear();
+        has_world_entities_.store(false, std::memory_order_release);
         worldRenderers_.clear();
         browsers_.clear();
         retired_world_renderers_.clear();
@@ -870,10 +875,9 @@ void BrowserManager::LaunchBrowserLocked(int id, const std::string& url)
 
     LOG_ERROR("[CEF] CefBrowserHost::CreateBrowser failed for browser ID {}.", id);
 
-    if (focusedBrowserId_ == id)
-        focusedBrowserId_ = -1;
+    int expected_focus = id;
+    focusedBrowserId_.compare_exchange_strong(expected_focus, -1, std::memory_order_acq_rel);
 
-    pending_.erase(id);
     RetireBrowserLocked(id);
     ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_Generic, "Browser creation failed");
 }
@@ -980,7 +984,6 @@ void BrowserManager::DestroyBrowser(int id)
     BrowsersLock lock(browsers_mutex_);
 
     player_stats_poll_.erase(id);
-    pending_.erase(id);
     CancelDrag(id);
 
     auto it = browsers_.find(id);
@@ -989,7 +992,7 @@ void BrowserManager::DestroyBrowser(int id)
 
     auto& instance = it->second;
 
-    if (focusedBrowserId_ == id)
+    if (focusedBrowserId_.load(std::memory_order_acquire) == id)
         FocusBrowser(id, false);
 
     if (instance->browser && instance->browser->GetHost())
@@ -1016,6 +1019,7 @@ void BrowserManager::DestroyBrowser(int id)
             ++eit;
         }
     }
+    has_world_entities_.store(!entityToBrowserId_.empty(), std::memory_order_release);
 
     if (instance->browser && instance->browser->GetHost())
     {
@@ -1209,6 +1213,7 @@ void BrowserManager::AttachBrowserToObject(int browserId, int objectId)
     if (nativeEntity)
     {
         entityToBrowserId_[nativeEntity] = browserId;
+        has_world_entities_.store(true, std::memory_order_release);
         audio_.SetStreamMuted(browserId, false); // unmute when attached
 
         LOG_DEBUG("[CEF] Browser {} attached to object {} (Entity: {})", browserId, objectId, (const void*)nativeEntity);
@@ -1231,6 +1236,7 @@ void BrowserManager::DetachBrowserFromObject(int browserId, int objectId)
         {
             OnAfterEntityRender(nativeEntity); // ensure texture restored
             entityToBrowserId_.erase(it);
+            has_world_entities_.store(!entityToBrowserId_.empty(), std::memory_order_release);
             audio_.SetStreamMuted(browserId, true); // mute when detached
             LOG_DEBUG("[CEF] Browser {} detached from object {} (Entity: {})",
                       browserId,
@@ -1282,7 +1288,6 @@ void BrowserManager::OnBrowserClosed(int id)
 
     BrowsersLock lock(browsers_mutex_);
     player_stats_poll_.erase(id);
-    pending_.erase(id);
     RetireBrowserLocked(id);
 }
 
@@ -1379,15 +1384,8 @@ void BrowserManager::DispatchScreenFrameOnUi(std::shared_ptr<CapturedScreenFrame
     complete();
 }
 
-void BrowserManager::ClearPendingPaint(int id)
+void BrowserManager::ClearPendingPaint(PendingPaint& pending_paint)
 {
-    BrowsersLock browsers_lock(browsers_mutex_);
-
-    auto it = pending_.find(id);
-    if (it == pending_.end())
-        return;
-
-    auto& pending_paint = it->second;
     std::lock_guard<std::mutex> lock(pending_paint.mutex);
     pending_paint.pixels.clear();
     pending_paint.dirty_rects.clear();
@@ -1395,6 +1393,27 @@ void BrowserManager::ClearPendingPaint(int id)
     pending_paint.height = 0;
     pending_paint.ready = false;
     pending_paint.tick = 0;
+}
+
+void BrowserManager::ClearPendingPaint(int id)
+{
+    BrowsersLock browsers_lock(browsers_mutex_);
+
+    auto* instance = GetBrowserInstance(id);
+    if (!instance)
+        return;
+
+    ClearPendingPaint(instance->pending_paint);
+}
+
+void BrowserManager::ReleaseStateBlock()
+{
+    if (game_state_block_)
+    {
+        game_state_block_->Release();
+        game_state_block_ = nullptr;
+    }
+    state_block_device_ = nullptr;
 }
 
 void BrowserManager::RestoreBrowserTextures()
@@ -1406,11 +1425,7 @@ void BrowserManager::RestoreBrowserTextures()
         if (!instance || !instance->visible)
             continue;
 
-        auto it = pending_.find(id);
-        if (it == pending_.end())
-            continue;
-
-        auto& pending_paint = it->second;
+        auto& pending_paint = instance->pending_paint;
         std::lock_guard<std::mutex> lock(pending_paint.mutex);
 
         if (pending_paint.pixels.empty() || pending_paint.width <= 0 || pending_paint.height <= 0)
@@ -1483,11 +1498,11 @@ void BrowserManager::OnPaint(int id, const void* buffer, int width, int height, 
 
     if (!instance->visible)
     {
-        ClearPendingPaint(id);
+        ClearPendingPaint(instance->pending_paint);
         return;
     }
 
-    auto& pending_paint = pending_[id];
+    auto& pending_paint = instance->pending_paint;
     {
         std::lock_guard<std::mutex> lock(pending_paint.mutex);
         const size_t buffer_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
@@ -1546,17 +1561,26 @@ void BrowserManager::OnPaint(int id, const void* buffer, int width, int height, 
 
 void BrowserManager::SendExternalBeginFrames()
 {
+    // Pace external begin frames to ~60Hz so high GTA framerates (150-300+ FPS)
+    // do not flood the CEF UI thread and Chromium compositor.
+    const uint64_t now = ::GetTickCount64();
+    const uint64_t last = last_begin_frame_ms_.load(std::memory_order_relaxed);
+    if (now - last < 16ULL)
+        return;
+
     if (!CefCurrentlyOn(TID_UI))
     {
         bool expected = false;
         if (!begin_frame_task_pending_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
             return;
 
+        last_begin_frame_ms_.store(now, std::memory_order_relaxed);
         if (!CefPostTask(TID_UI, base::BindOnce(&BrowserManager::DispatchExternalBeginFramesOnUi, base::Unretained(this))))
             begin_frame_task_pending_.store(false, std::memory_order_release);
         return;
     }
 
+    last_begin_frame_ms_.store(now, std::memory_order_relaxed);
     DispatchExternalBeginFramesOnUi();
 }
 
@@ -1588,25 +1612,67 @@ bool BrowserManager::RenderAll()
     if (ShouldSkipBrowserRendering())
         return false;
 
-    BrowsersLock browsers_lock(browsers_mutex_);
-
     UpdateAudioSpatialization();
     SendExternalBeginFrames();
 
-    for (auto& [id, inst] : browsers_)
+    struct RenderSnapshot
     {
-        if (!inst)
-            continue;
+        BrowserInstance* browser;
+        WorldRenderer* world_renderer;
+        int layer;
+        bool visible;
+        bool closing;
+    };
+
+    // Snapshot active browser pointers under browsers_mutex_, then release the lock
+    // before performing D3D9 texture locks/uploads and draw calls so OnPaint() and
+    // WndProc input on other threads are never blocked by rendering.
+    // All BrowserInstance / WorldRenderer lifetimes are owned until the next
+    // ReleaseRetiredResources() call on this same game thread.
+    std::vector<RenderSnapshot> snapshot;
+    {
+        BrowsersLock browsers_lock(browsers_mutex_);
+        if (browsers_.empty())
+            return false;
+
+        snapshot.reserve(browsers_.size());
+        for (auto& [id, inst] : browsers_)
+        {
+            if (!inst)
+                continue;
+
+            WorldRenderer* wr = nullptr;
+            if (inst->mode == RenderMode::WorldObject3D)
+            {
+                if (auto it = worldRenderers_.find(id); it != worldRenderers_.end())
+                    wr = it->second.get();
+            }
+
+            snapshot.push_back(RenderSnapshot{
+                inst.get(),
+                wr,
+                inst->layer.load(std::memory_order_relaxed),
+                inst->visible,
+                inst->closing
+            });
+        }
+    }
+
+    std::vector<RenderSnapshot> render_order;
+    render_order.reserve(snapshot.size());
+
+    for (const auto& entry : snapshot)
+    {
+        auto* inst = entry.browser;
 
         if (inst->clear_texture.exchange(false, std::memory_order_acq_rel))
         {
-            ClearPendingPaint(id);
+            ClearPendingPaint(inst->pending_paint);
 
             if (inst->mode == RenderMode::WorldObject3D)
             {
-                auto world_renderer = worldRenderers_.find(id);
-                if (world_renderer != worldRenderers_.end() && world_renderer->second)
-                    world_renderer->second->Clear();
+                if (entry.world_renderer)
+                    entry.world_renderer->Clear();
             }
             else
             {
@@ -1614,72 +1680,58 @@ bool BrowserManager::RenderAll()
             }
         }
 
-        if (!inst->visible)
+        if (!entry.visible)
         {
-            ClearPendingPaint(id);
+            ClearPendingPaint(inst->pending_paint);
             continue;
         }
 
-        auto it = pending_.find(id);
-        if (it == pending_.end())
-            continue;
-
-        auto& pending_paint = it->second;
-        std::lock_guard<std::mutex> lock(pending_paint.mutex);
-
-        if (!pending_paint.ready || pending_paint.pixels.empty())
-            continue;
-
-        if (pending_paint.width <= 0 || pending_paint.height <= 0)
         {
-            pending_paint.ready = false;
-            continue;
-        }
+            auto& pending_paint = inst->pending_paint;
+            std::lock_guard<std::mutex> lock(pending_paint.mutex);
 
-        cef_rect_t rect{ 0, 0, pending_paint.width, pending_paint.height };
-        const cef_rect_t* dirty_rects = pending_paint.dirty_rects.empty() ? &rect : pending_paint.dirty_rects.data();
-        const size_t dirty_rect_count = pending_paint.dirty_rects.empty() ? 1 : pending_paint.dirty_rects.size();
-
-        if (inst->mode == RenderMode::WorldObject3D)
-        {
-            auto world_renderer = worldRenderers_.find(id);
-            if (world_renderer != worldRenderers_.end() && world_renderer->second)
+            if (pending_paint.ready && !pending_paint.pixels.empty())
             {
-                world_renderer->second->OnPaint(
-                    pending_paint.pixels.data(),
-                    pending_paint.width,
-                    pending_paint.height
-                );
+                if (pending_paint.width > 0 && pending_paint.height > 0)
+                {
+                    if (inst->mode == RenderMode::WorldObject3D)
+                    {
+                        if (entry.world_renderer)
+                        {
+                            entry.world_renderer->OnPaint(
+                                pending_paint.pixels.data(),
+                                pending_paint.width,
+                                pending_paint.height
+                            );
+                        }
+                    }
+                    else
+                    {
+                        const cef_rect_t* dirty_rects = pending_paint.dirty_rects.empty() ? nullptr : pending_paint.dirty_rects.data();
+                        const size_t dirty_rect_count = pending_paint.dirty_rects.size();
+                        inst->view.UpdateTexture(
+                            pending_paint.pixels.data(),
+                            pending_paint.width,
+                            pending_paint.height,
+                            dirty_rects,
+                            dirty_rect_count);
+                    }
+                }
+
+                pending_paint.ready = false;
+                pending_paint.dirty_rects.clear();
             }
         }
-        else
-        {
-            inst->view.UpdateTexture(pending_paint.pixels.data(), dirty_rects, dirty_rect_count);
-        }
 
-        pending_paint.ready = false;
-        pending_paint.dirty_rects.clear();
-    }
-
-    struct RenderEntry
-    {
-        BrowserInstance* browser;
-        int layer;
-    };
-    std::vector<RenderEntry> render_order;
-    render_order.reserve(browsers_.size());
-    for (auto& [id, browser] : browsers_)
-    {
-        if (browser && browser->visible && !browser->closing && browser->mode != RenderMode::WorldObject3D)
-            render_order.push_back({browser.get(), browser->layer.load(std::memory_order_relaxed)});
+        if (!entry.closing && inst->mode != RenderMode::WorldObject3D)
+            render_order.push_back(entry);
     }
 
     if (render_order.empty())
         return false;
 
-    // Snapshot layers before sorting so concurrent updates cannot change the comparator.
     // Equal layers use browser IDs, making draw order independent of unordered_map layout.
-    std::sort(render_order.begin(), render_order.end(), [](const RenderEntry& a, const RenderEntry& b) {
+    std::sort(render_order.begin(), render_order.end(), [](const RenderSnapshot& a, const RenderSnapshot& b) {
         return a.layer != b.layer ? a.layer < b.layer : a.browser->id < b.browser->id;
     });
 
@@ -1688,14 +1740,28 @@ bool BrowserManager::RenderAll()
     if (!device || FAILED(device->BeginScene()))
         return false;
 
-    // Save the game's state once for all browser draws, including stream 0
-    // which DrawPrimitiveUP clears.
-    IDirect3DStateBlock9* game_state = nullptr;
-    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &game_state)))
+    // Reuse a cached state block across frames to avoid per-frame D3DSBT_ALL allocation
+    // overhead (especially expensive on Wine/DXVK and D3D9 drivers).
+    if (state_block_device_ != device)
+        ReleaseStateBlock();
+
+    if (!game_state_block_)
+    {
+        if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &game_state_block_)) || !game_state_block_)
+        {
+            device->EndScene();
+            return false;
+        }
+        state_block_device_ = device;
+    }
+
+    if (FAILED(game_state_block_->Capture()))
     {
         device->EndScene();
         return false;
     }
+
+    ViewTexture::BeginDrawPass(device);
 
     bool any_visible = false;
     for (const auto& entry : render_order)
@@ -1741,8 +1807,7 @@ bool BrowserManager::RenderAll()
         }
     }
 
-    game_state->Apply();
-    game_state->Release();
+    game_state_block_->Apply();
     device->EndScene();
 
     return any_visible;
@@ -1750,7 +1815,7 @@ bool BrowserManager::RenderAll()
 
 void BrowserManager::OnBeforeEntityRender(CEntity* entity)
 {
-    if (ShouldSkipBrowserRendering())
+    if (!has_world_entities_.load(std::memory_order_acquire) || ShouldSkipBrowserRendering())
         return;
 
     BrowsersLock browsers_lock(browsers_mutex_);
@@ -1777,6 +1842,9 @@ void BrowserManager::OnBeforeEntityRender(CEntity* entity)
 
 void BrowserManager::OnAfterEntityRender(CEntity* entity)
 {
+    if (!has_world_entities_.load(std::memory_order_acquire))
+        return;
+
     BrowsersLock browsers_lock(browsers_mutex_);
 
     if (entityToBrowserId_.empty())
@@ -1894,11 +1962,15 @@ void BrowserManager::FocusBrowser(int browserId, bool focus)
 
 BrowserInstance* BrowserManager::GetFocusedBrowser()
 {
-    return focusedBrowserId_ == -1 ? nullptr : GetBrowserInstance(focusedBrowserId_);
+    const int id = focusedBrowserId_.load(std::memory_order_acquire);
+    return id == -1 ? nullptr : GetBrowserInstance(id);
 }
 
 void BrowserManager::UpdateAudioSpatialization()
 {
+    if (!has_world_entities_.load(std::memory_order_acquire))
+        return;
+
     // Update listener from player camera
     if (CPlayerPed* player = FindPlayerPed(-1))
     {
@@ -1940,10 +2012,28 @@ void BrowserManager::EnableKey(int key, bool enabled)
     LOG_INFO("[CEF] Key {} {}", key, enabled ? "enabled" : "disabled");
 }
 
+void BrowserManager::RestoreFocusedBrowserOnUi()
+{
+    if (!CefCurrentlyOn(TID_UI))
+    {
+        CefPostTask(TID_UI, base::BindOnce(&BrowserManager::RestoreFocusedBrowserOnUi, base::Unretained(this)));
+        return;
+    }
+
+    BrowsersLock browsers_lock(browsers_mutex_);
+    auto* focused = GetFocusedBrowser();
+    if (!focused || !focused->browser || !focused->browser->IsValid())
+        return;
+
+    if (auto host = focused->browser->GetHost())
+        host->SetFocus(true);
+}
+
 void BrowserManager::OnGameFocusGained()
 {
     RestoreBrowserTextures();
     RequestVisibleBrowsersRepaint();
+    RestoreFocusedBrowserOnUi();
 }
 
 void BrowserManager::OnGameFocusLost()
@@ -2002,11 +2092,12 @@ bool BrowserManager::ShouldSkipBrowserRendering() const
 
 bool BrowserManager::IsFocusedTextInputActive() const
 {
-    if (!focus_ || focusedBrowserId_ < 0)
+    const int focused_id = focusedBrowserId_.load(std::memory_order_acquire);
+    if (!focus_ || focused_id < 0)
         return false;
 
     BrowsersLock browsers_lock(browsers_mutex_);
-    const auto browser = browsers_.find(focusedBrowserId_);
+    const auto browser = browsers_.find(focused_id);
     return browser != browsers_.end()
         && browser->second
         && focus_->IsTextInputFocused(browser->second->id);
@@ -2129,6 +2220,7 @@ void BrowserManager::OnDeviceLost()
     // This prevents CEF from trying to update textures while they're invalid
     isCefUpdatesPaused_ = true;
     screen_capture_.OnDeviceLost();
+    ReleaseStateBlock();
 
     // Called from the Reset hook on the game thread.
     ReleaseRetiredResources();
@@ -2403,11 +2495,21 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
         CancelDrag();
     }
 
-    auto* focused_inst = GetFocusedBrowser();
-    if (!focused_inst || !focused_inst->browser)
-        return false;
+    int focused_id = -1;
+    CefRefPtr<CefBrowser> focused_browser;
+    cef_rect_t view_rect{ 0, 0, 0, 0 };
+    {
+        BrowsersLock browsers_lock(browsers_mutex_);
+        auto* focused_inst = GetFocusedBrowser();
+        if (!focused_inst || !focused_inst->browser)
+            return false;
 
-    auto host = focused_inst->browser->GetHost();
+        focused_id = focused_inst->id;
+        focused_browser = focused_inst->browser;
+        view_rect = focused_inst->view.rect();
+    }
+
+    auto host = focused_browser->GetHost();
     if (!host)
         return false;
 
@@ -2429,6 +2531,20 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
             if (msg == WM_MOUSEWHEEL)
                 ScreenToClient(hwnd, &point);
 
+            // Scale mouse coordinates if the window client rect differs from the CEF view size
+            // (common in Wine virtual desktop, windowed/borderless modes, or DPI scaling).
+            RECT client_rect{};
+            if (view_rect.width > 0 && view_rect.height > 0 && ::GetClientRect(hwnd, &client_rect))
+            {
+                const int client_w = client_rect.right - client_rect.left;
+                const int client_h = client_rect.bottom - client_rect.top;
+                if (client_w > 0 && client_h > 0 && (client_w != view_rect.width || client_h != view_rect.height))
+                {
+                    point.x = static_cast<LONG>((static_cast<int64_t>(point.x) * view_rect.width) / client_w);
+                    point.y = static_cast<LONG>((static_cast<int64_t>(point.y) * view_rect.height) / client_h);
+                }
+            }
+
             CefMouseEvent evt;
             evt.x = point.x;
             evt.y = point.y;
@@ -2444,7 +2560,7 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
             }
             else if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK)
             {
-                const int clickCount = BeginMouseClick(left_click_, focused_inst->id, evt.x, evt.y, msg == WM_LBUTTONDBLCLK);
+                const int clickCount = BeginMouseClick(left_click_, focused_id, evt.x, evt.y, msg == WM_LBUTTONDBLCLK);
                 host->SendMouseClickEvent(evt, MBT_LEFT, false, clickCount);
                 SetCapture(hwnd);
             }
@@ -2457,14 +2573,14 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
             }
             else if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK)
             {
-                const int clickCount = BeginMouseClick(right_click_, focused_inst->id, evt.x, evt.y, msg == WM_RBUTTONDBLCLK);
+                const int clickCount = BeginMouseClick(right_click_, focused_id, evt.x, evt.y, msg == WM_RBUTTONDBLCLK);
                 host->SendMouseClickEvent(evt, MBT_RIGHT, false, clickCount);
             }
             else if (msg == WM_RBUTTONUP)
                 host->SendMouseClickEvent(evt, MBT_RIGHT, true, right_click_.activeCount);
             else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK)
             {
-                const int clickCount = BeginMouseClick(middle_click_, focused_inst->id, evt.x, evt.y, msg == WM_MBUTTONDBLCLK);
+                const int clickCount = BeginMouseClick(middle_click_, focused_id, evt.x, evt.y, msg == WM_MBUTTONDBLCLK);
                 host->SendMouseClickEvent(evt, MBT_MIDDLE, false, clickCount);
             }
             else if (msg == WM_MBUTTONUP)
@@ -2478,7 +2594,7 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
         case WM_KEYUP:
         case WM_CHAR:
         {
-            const bool textInputFocused = (focus_ != nullptr) && focus_->IsTextInputFocused(focused_inst->id);
+            const bool textInputFocused = (focus_ != nullptr) && focus_->IsTextInputFocused(focused_id);
             if (!textInputFocused)
             {
                 // T chat, TAB scoreboard, etc..

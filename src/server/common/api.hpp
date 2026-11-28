@@ -19,7 +19,7 @@ public:
 
     bool PlayerHasPlugin(int playerid);
     void AddResource(const std::string& resourceName);
-    void CreateBrowser(int playerid, int browserid, const std::string& url, bool focused, bool controls_chat);
+    void CreateBrowser(int playerid, int browserid, const std::string& url, bool focused, bool controls_chat, float width, float height);
     void CreateWorldBrowser(int playerid, int browserid, const std::string& url, const std::string& textureName, float width, float height);
     void CreateWorld2DBrowser(int playerid, int browserid, const std::string& url, float worldX, float worldY, float worldZ, float width, float height, float offsetZ, float pivotX, float pivotY);
     void SetWorld2DBrowserPos(int playerid, int browserid, float worldX, float worldY, float worldZ);

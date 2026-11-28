@@ -448,7 +448,9 @@ void App::HandlePacket(const NetworkPacket& packet)
                 bool focused = event.args[2].boolValue;
                 bool controls_chat = event.args[3].boolValue;
 
-                QueueOrCreateOverlay(id, url, focused, controls_chat, -1.f, -1.f);
+                QueueOrCreateOverlay(id, url, focused, controls_chat,
+                    event.args.size() > 4 ? event.args[4].floatValue : -1.f,
+                    event.args.size() > 5 ? event.args[5].floatValue : -1.f);
             }
             else if (event.name == CefEvent::Server::CreateWorldBrowser && event.args.size() >= 5) {
                 int id = event.args[0].intValue;

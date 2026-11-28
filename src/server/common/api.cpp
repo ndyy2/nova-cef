@@ -28,7 +28,7 @@ void CefApi::AddResource(const std::string& resourceName)
     );
 }
 
-void CefApi::CreateBrowser(int playerid, int browserid, const std::string& url, bool focused, bool controls_chat)
+void CefApi::CreateBrowser(int playerid, int browserid, const std::string& url, bool focused, bool controls_chat, float width, float height)
 {
     EmitEventPacket event;
 
@@ -37,6 +37,8 @@ void CefApi::CreateBrowser(int playerid, int browserid, const std::string& url, 
     event.args.emplace_back(url);
     event.args.emplace_back(focused);
     event.args.emplace_back(controls_chat);
+    event.args.emplace_back(width);
+    event.args.emplace_back(height);
 
     plugin_.SendPacketToPlayer(playerid, PacketType::EmitEvent, event);
 }

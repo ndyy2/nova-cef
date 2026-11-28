@@ -184,6 +184,12 @@ void NetworkManager::Connect(int playerid)
 		socket_.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), 0), ec);
 		if (ec) throw std::runtime_error("Socket bind failed: " + ec.message());
 
+		{
+			asio::error_code buf_ec;
+			socket_.set_option(asio::socket_base::receive_buffer_size(512 * 1024), buf_ec);
+			socket_.set_option(asio::socket_base::send_buffer_size(512 * 1024), buf_ec);
+		}
+
 		LOG_INFO("[CLIENT] Socket opened and bound to local port {}.", socket_.local_endpoint().port());
 		DoReceive();
 
@@ -533,7 +539,8 @@ void NetworkManager::HandleRawMessage(const char* data, size_t len)
 				kcp_instance_->output = kcp_client_output_callback;
 				ikcp_setmtu(kcp_instance_, KCP_SAFE_MTU);
 				ikcp_nodelay(kcp_instance_, 1, 10, 2, 1);
-				ikcp_wndsize(kcp_instance_, 128, 128);
+				ikcp_wndsize(kcp_instance_, 256, 256);
+				ikcp_update(kcp_instance_, iclock());
 			}
 
 			if (rx_key_.empty() || tx_key_.empty()) {
@@ -625,13 +632,13 @@ void NetworkManager::CleanupTransport()
             ikcp_release(kcp_instance_);
             kcp_instance_ = nullptr;
         }
+        rx_key_.clear();
+        tx_key_.clear();
     }
 
     if (socket_.is_open())
         socket_.close(ignored);
 
-    rx_key_.clear();
-    tx_key_.clear();
     client_public_key_.clear();
     client_private_key_.clear();
     pending_finalize_pkt_ = HandshakeFinalizePacket{};
@@ -694,10 +701,16 @@ void NetworkManager::SendPacket(PacketType type, const PacketPayload& payload)
 			return;
 		}
 
+		// Ensure kcp->current and kcp->updated are fresh so ikcp_flush transmits immediately.
+		ikcp_update(kcp_instance_, iclock());
 		ikcp_flush(kcp_instance_);
 	}
-	else {
+	else if (type == PacketType::RequestJoin || type == PacketType::HandshakeFinalize) {
 		SendRaw(raw.data(), static_cast<int>(raw.size()));
+	}
+	else {
+		LOG_WARN("[CLIENT] Dropping packet type {} because CEF KCP session is not connected (state={}).",
+			static_cast<int>(type), static_cast<int>(state_.load()));
 	}
 }
 

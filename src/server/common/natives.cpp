@@ -11,9 +11,9 @@ PAWN_NATIVE(Natives, CEF_AddResource, void(const std::string& resourceName))
     CefApi::Instance()->AddResource(resourceName);
 }
 
-PAWN_NATIVE(Natives, CEF_CreateBrowser, void(int playerid, int browserid, const std::string& url, bool focused, bool controls_chat))
+PAWN_NATIVE(Natives, CEF_CreateBrowser, void(int playerid, int browserid, const std::string& url, bool focused, bool controls_chat, float width, float height))
 {
-    CefApi::Instance()->CreateBrowser(playerid, browserid, url, focused, controls_chat);
+    CefApi::Instance()->CreateBrowser(playerid, browserid, url, focused, controls_chat, width, height);
 }
 
 PAWN_NATIVE(Natives, CEF_CreateWorldBrowser, void(int playerid, int browserid, const std::string& url, const std::string& textureName, float width, float height))

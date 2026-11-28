@@ -18,7 +18,7 @@ public:
     void Resize(int width, int height);
 
     // Updates the texture using CEF dirty rectangles for optimized partial updates
-    void UpdateTexture(const uint8_t* data, const cef_rect_t* dirtyRects, size_t count);
+    void UpdateTexture(const uint8_t* data, int bufferWidth, int bufferHeight, const cef_rect_t* dirtyRects, size_t count);
 
     // Performs a simple full texture update from a raw buffer
     void OnPaint(const void* buffer, int width, int height);

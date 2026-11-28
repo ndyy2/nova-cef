@@ -25,6 +25,7 @@ public:
 
     // CefClient overrides
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; };
+    CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
     CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
     CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
     CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
@@ -33,6 +34,11 @@ public:
         CefRefPtr<CefFrame> frame,
         CefProcessId source_process,
         CefRefPtr<CefProcessMessage> message) override;
+
+    // CefLoadHandler overrides
+    void OnLoadEnd(CefRefPtr<CefBrowser> browser,
+        CefRefPtr<CefFrame> frame,
+        int httpStatusCode) override;
 
     // CefLifeSpanHandler overrides
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override;

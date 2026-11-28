@@ -156,8 +156,8 @@ native CEF_AddResource(const resourceName[]);
  * @param focused           If 'true', the browser will immediately gain input focus.
  * @param controls_chat     (Optional) If 'true' (default), the game's chat input will be
  * disabled when the player is typing in an HTML input field.
- * @param width             (Optional) The width of the browser viewport in pixels. Defaults to -1 for fullscreen width.
- * @param height            (Optional) The height of the browser viewport in pixels. Defaults to -1 for fullscreen height.
+ * @param width             (Optional) The width of the browser viewport in pixels. Defaults to 0.0 for fullscreen width.
+ * @param height            (Optional) The height of the browser viewport in pixels. Defaults to 0.0 for fullscreen height.
 */
 native CEF_CreateBrowser(playerid, browserid, const url[], bool:focused, bool:controls_chat = true, Float:width = 0.0, Float:height = 0.0);
 

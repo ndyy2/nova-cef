@@ -54,12 +54,28 @@ void LoadCefClientDll()
     }
 }
 
+DWORD WINAPI LoadCefClientThread(LPVOID)
+{
+    LoadCefClientDll();
+    return 0;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID)
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
-        LoadCefClientDll();
+
+        // Never call LoadLibraryW inside DllMain (loader lock deadlock risk on Windows and Wine).
+        HANDLE hThread = CreateThread(nullptr, 0, LoadCefClientThread, nullptr, 0, nullptr);
+        if (hThread)
+        {
+            CloseHandle(hThread);
+        }
+        else
+        {
+            LoadCefClientDll();
+        }
     }
 
     return TRUE;

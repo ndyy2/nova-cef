@@ -53,7 +53,7 @@ public:
         bool focused, bool controlsChat) override
     {
         auto* api = CefApi::Instance();
-        if (api) api->CreateBrowser(playerid, browserid, Str(url), focused, controlsChat);
+        if (api) api->CreateBrowser(playerid, browserid, Str(url), focused, controlsChat, 0.f, 0.f);
     }
 
     void createWorldBrowser(int playerid, int browserid, const char* url,

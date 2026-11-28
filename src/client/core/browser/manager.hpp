@@ -59,6 +59,17 @@ struct World2DBrowserData
     float pivotY = 1.0f;
 };
 
+struct PendingPaint
+{
+    std::mutex mutex;
+    std::vector<uint8_t> pixels;
+    std::vector<cef_rect_t> dirty_rects;
+    int width = 0;
+    int height = 0;
+    bool ready = false;
+    uint64_t tick = 0;
+};
+
 // Holds all data and state related to a single browser instance
 struct BrowserInstance
 {
@@ -67,6 +78,7 @@ struct BrowserInstance
     CefRefPtr<BrowserClient> client;
     CefRefPtr<CefBrowser> browser;
     View view;
+    PendingPaint pending_paint;
 
     RenderMode mode = RenderMode::Overlay2D;
     std::string textureName; // Used only for WorldObject3D mode
@@ -88,17 +100,6 @@ struct BrowserInstance
     CefRefPtr<CefBrowser> devtools_browser;
 
     explicit BrowserInstance(int id) : id(id), view(id) {}
-};
-
-struct PendingPaint
-{
-    std::mutex mutex;
-    std::vector<uint8_t> pixels;
-    std::vector<cef_rect_t> dirty_rects;
-    int width = 0;
-    int height = 0;
-    bool ready = false;
-    uint64_t tick = 0;
 };
 
 class BrowserManager
@@ -234,7 +235,10 @@ private:
     void LaunchBrowserLocked(int id, const std::string& url);
     void ReportBrowserCreateFailure(int id, BrowserCreateStatus status, const std::string& reason);
     void ReleaseRetiredResources();
+    void ReleaseStateBlock();
+    void RestoreFocusedBrowserOnUi();
     void ClearPendingPaint(int id);
+    static void ClearPendingPaint(PendingPaint& pending_paint);
     void RestoreBrowserTextures();
     void RequestVisibleBrowsersRepaint();
     void SendExternalBeginFrames();
@@ -265,7 +269,7 @@ private:
     std::atomic<bool> isCefUpdatesPaused_{ false };
 
     // The single source for which browser has focus. -1 means none.
-    int focusedBrowserId_ = -1;
+    std::atomic<int> focusedBrowserId_{ -1 };
 
     using BrowsersLock = std::lock_guard<std::recursive_mutex>;
     mutable std::recursive_mutex browsers_mutex_;
@@ -273,9 +277,13 @@ private:
     std::unordered_map<int, std::unique_ptr<BrowserInstance>> browsers_;
     std::unordered_map<int, std::unique_ptr<WorldRenderer>> worldRenderers_;
     std::unordered_map<CEntity*, int> entityToBrowserId_;
+    std::atomic<bool> has_world_entities_{ false };
 
     std::vector<std::unique_ptr<BrowserInstance>> retired_browsers_;
     std::vector<std::unique_ptr<WorldRenderer>> retired_world_renderers_;
+
+    IDirect3DStateBlock9* game_state_block_ = nullptr;
+    IDirect3DDevice9* state_block_device_ = nullptr;
 
     bool draw_enabled_ = true;
     cef_cursor_type_t cursor_type_ = CT_POINTER;
@@ -288,8 +296,8 @@ private:
 
     std::function<CEntity*(int)> entity_resolver_{};
 
-    std::unordered_map<int, PendingPaint> pending_;
     std::atomic<bool> begin_frame_task_pending_{false};
+    std::atomic<uint64_t> last_begin_frame_ms_{0};
 
     struct DragState
     {

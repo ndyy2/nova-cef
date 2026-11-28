@@ -126,19 +126,23 @@ bool BrowserClient::OnBeforePopup(CefRefPtr<CefBrowser> browser,
     return true;
 }
 
-void BrowserClient::OnAfterCreated(CefRefPtr<CefBrowser> browser)
+static void InjectFocusTrackingScript(CefRefPtr<CefFrame> frame)
 {
-    CEF_REQUIRE_UI_THREAD();
-    manager_.OnBrowserCreated(browserId_, browser);
+    if (!frame || !frame->IsValid())
+        return;
 
-    // Inject focus tracking script
     const char* control_chat_js_script = R"JS(
         (function() {
+            if (window.__ompCefFocusHooked) return;
+            window.__ompCefFocusHooked = true;
             let isFocused = false;
             const checkFocus = (target) => {
-                const isInput = target.tagName === 'INPUT' || 
-                                target.tagName === 'TEXTAREA' || 
-                                target.isContentEditable;
+                const isInput = Boolean(target && (
+                    target.tagName === 'INPUT' ||
+                    target.tagName === 'TEXTAREA' ||
+                    target.tagName === 'SELECT' ||
+                    target.isContentEditable
+                ));
                 if (isInput !== isFocused) {
                     isFocused = isInput;
                     if (window.cef && window.cef.emit) {
@@ -147,19 +151,32 @@ void BrowserClient::OnAfterCreated(CefRefPtr<CefBrowser> browser)
                 }
             };
             document.addEventListener('focusin', (e) => checkFocus(e.target), true);
-            document.addEventListener('focusout', (e) => {
-                if (isFocused) {
-                    isFocused = false;
-                    if (window.cef && window.cef.emit) {
-                        window.cef.emit('omp:cef:internal:inputFocusChanged', false);
-                    }
-                }
+            document.addEventListener('focusout', () => {
+                setTimeout(() => checkFocus(document.activeElement), 0);
             }, true);
             document.addEventListener('mousedown', (e) => checkFocus(e.target), true);
         })();
     )JS";
 
-    browser->GetMainFrame()->ExecuteJavaScript(control_chat_js_script, browser->GetMainFrame()->GetURL(), 0);
+    frame->ExecuteJavaScript(control_chat_js_script, frame->GetURL(), 0);
+}
+
+void BrowserClient::OnAfterCreated(CefRefPtr<CefBrowser> browser)
+{
+    CEF_REQUIRE_UI_THREAD();
+    manager_.OnBrowserCreated(browserId_, browser);
+    InjectFocusTrackingScript(browser->GetMainFrame());
+}
+
+void BrowserClient::OnLoadEnd(CefRefPtr<CefBrowser> /*browser*/,
+                              CefRefPtr<CefFrame> frame,
+                              int /*httpStatusCode*/)
+{
+    CEF_REQUIRE_UI_THREAD();
+    if (frame && frame->IsMain())
+    {
+        InjectFocusTrackingScript(frame);
+    }
 }
 
 void BrowserClient::GetViewRect(CefRefPtr<CefBrowser> /*browser*/, CefRect& rect)
@@ -273,12 +290,14 @@ bool BrowserClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser*/,
             CefValueType type = args->GetType(i);
             if (type == VTYPE_BOOL)
                 event_packet.args.emplace_back(args->GetBool(i));
-            else if (type == VTYPE_INT)   
+            else if (type == VTYPE_INT)
                 event_packet.args.emplace_back(args->GetInt(i));
             else if (type == VTYPE_DOUBLE)
                 event_packet.args.emplace_back(static_cast<float>(args->GetDouble(i)));
             else if (type == VTYPE_STRING)
                 event_packet.args.emplace_back(args->GetString(i).ToString());
+            else
+                event_packet.args.emplace_back(std::string{});
         }
 
 		network_.SendPacket(PacketType::ClientEmitEvent, event_packet);
@@ -328,6 +347,8 @@ bool BrowserClient::OnBeforeBrowse(CefRefPtr<CefBrowser> browser,
     if (frame && frame->IsMain() &&
         StripFragment(frame->GetURL().ToString()) != StripFragment(url))
     {
+        if (focus_)
+            focus_->SetInputFocus(browserId_, false);
         manager_.RequestTextureClear(browserId_);
     }
 
@@ -445,14 +466,21 @@ bool BrowserClient::OnConsoleMessage(CefRefPtr<CefBrowser> browser,
         default: level_str = "INFO"; break;
     }
     
-    if (message.ToString().find("153") != std::string::npos ||
-        message.ToString().find("playback") != std::string::npos ||
-        message.ToString().find("ErrorNotSupported") != std::string::npos) {
+    const std::string msg_str = message.ToString();
+    if (msg_str.find("153") != std::string::npos ||
+        msg_str.find("playback") != std::string::npos ||
+        msg_str.find("ErrorNotSupported") != std::string::npos) {
         LOG_ERROR("[VIDEO ERROR] [JS Console {}] {} ({}:{})", 
-            level_str, message.ToString(), source.ToString(), line);
+            level_str, msg_str, source.ToString(), line);
+    } else if (level == LOGSEVERITY_ERROR) {
+        LOG_ERROR("[JS Console {}] {} ({}:{})",
+            level_str, msg_str, source.ToString(), line);
+    } else if (level == LOGSEVERITY_WARNING) {
+        LOG_WARN("[JS Console {}] {} ({}:{})",
+            level_str, msg_str, source.ToString(), line);
     } else {
-        LOG_INFO("[JS Console {}] {} ({}:{})", 
-            level_str, message.ToString(), source.ToString(), line);
+        LOG_DEBUG("[JS Console {}] {} ({}:{})", 
+            level_str, msg_str, source.ToString(), line);
     }
     return false;
 }

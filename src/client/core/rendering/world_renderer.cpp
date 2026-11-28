@@ -17,7 +17,7 @@ WorldRenderer::WorldRenderer(const std::string& textureName, float width, float 
         return;
     }
 
-    viewTexture_ = std::make_unique<ViewTexture>(device, width_, height_);
+    viewTexture_ = std::make_unique<ViewTexture>(device, width_, height_, true);
     rwReplacement_ = viewTexture_->GetRwTexture();
 }
 
